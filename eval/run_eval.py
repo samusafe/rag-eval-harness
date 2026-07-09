@@ -44,19 +44,19 @@ from pathlib import Path
 APP_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(APP_ROOT))
 
+from langchain_core.output_parsers import StrOutputParser  # noqa: E402
 from rich.console import Console  # noqa: E402
 from rich.table import Table  # noqa: E402
-from langchain_core.output_parsers import StrOutputParser  # noqa: E402
 
 from config import settings  # noqa: E402
-from services.rag_chain import get_rag_chain  # noqa: E402
 from services.eval_service import (  # noqa: E402
-    load_eval_set,
-    aggregate,
-    write_results,
-    log_mlflow,
     _eval_one,
+    aggregate,
+    load_eval_set,
+    log_mlflow,
+    write_results,
 )
+from services.rag_chain import get_rag_chain  # noqa: E402
 
 console = Console()
 

@@ -10,13 +10,12 @@ load_duration); this module turns them into tokens/sec.
 from __future__ import annotations
 
 import statistics
-from typing import Optional
 
 NS_PER_S = 1_000_000_000
 NS_PER_MS = 1_000_000
 
 
-def tps(count: Optional[int], duration_ns: Optional[int]) -> Optional[float]:
+def tps(count: int | None, duration_ns: int | None) -> float | None:
     """Tokens/sec from a token count + a nanosecond duration; None if either
     is missing/zero (a benchmark must report "no data", never divide-by-zero)."""
     if not count or not duration_ns:

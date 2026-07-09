@@ -37,7 +37,7 @@ def load_eval_set(path: Path) -> list[dict]:
     A malformed line is logged and dropped — never silently ignored, never
     fatal for the rest of the set."""
     rows: list[dict] = []
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         for line_num, line in enumerate(f, 1):
             line = line.strip()
             if not line or line.startswith("//"):

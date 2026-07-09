@@ -19,7 +19,7 @@ def test_eval_set_rows_match_schema():
     rows = load_eval_set(EVAL_SET)
     seen_ids = set()
     for row in rows:
-        assert REQUIRED_KEYS <= row.keys(), f"row {row.get('id')} missing keys"
+        assert row.keys() >= REQUIRED_KEYS, f"row {row.get('id')} missing keys"
         assert isinstance(row["id"], str) and row["id"], "id must be a non-empty string"
         assert row["id"] not in seen_ids, f"duplicate id: {row['id']}"
         seen_ids.add(row["id"])
