@@ -206,3 +206,7 @@ against a live model is a manual step against your own local stack.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+---
+
+*Extracted from LocalVault, a private on-premise AI platform I'm building.*
