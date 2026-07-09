@@ -1,0 +1,20 @@
+// RAG eval set — SYNTHETIC example questions about a fictional generic
+// company handbook ("Aperture Retail Co."). Schema per line (JSON):
+//   {"id", "question", "expected_sources":[substrings of source_file],
+//    "expected_keywords":[strings the answer should contain], "must_refuse": bool}
+// Lines starting with // are comments and are ignored by the loader.
+//
+// This file ships ready to run against a demo/fake ingestion of a handbook
+// with these documents: employee-handbook.pdf, security-policy.pdf,
+// expense-policy.pdf, benefits-guide.pdf. Swap in your own docs/questions —
+// keep the schema, change expected_sources/expected_keywords to match.
+{"id": "vacation-days", "question": "How many paid vacation days do full-time employees get per year?", "expected_sources": ["employee-handbook"], "expected_keywords": ["20 days"], "must_refuse": false}
+{"id": "remote-eligibility", "question": "Who is eligible for remote work and how many days in the office are required?", "expected_sources": ["employee-handbook"], "expected_keywords": ["probation", "two days"], "must_refuse": false}
+{"id": "password-policy", "question": "What are the company's password and MFA requirements?", "expected_sources": ["security-policy"], "expected_keywords": ["MFA", "12 characters"], "must_refuse": false}
+{"id": "travel-receipts", "question": "How long do I have to submit travel expense receipts?", "expected_sources": ["expense-policy"], "expected_keywords": ["30 days"], "must_refuse": false}
+{"id": "health-insurance", "question": "Does the company provide health insurance, and starting from when?", "expected_sources": ["benefits-guide"], "expected_keywords": ["first day"], "must_refuse": false}
+{"id": "vpn-required", "question": "Is a VPN required to access company systems remotely?", "expected_sources": ["security-policy"], "expected_keywords": ["VPN"], "must_refuse": false}
+{"id": "parental-leave", "question": "How many weeks of parental leave does the company offer?", "expected_sources": ["benefits-guide"], "expected_keywords": ["12 weeks"], "must_refuse": false}
+{"id": "refuse-capital-city", "question": "What is the capital of Australia and its 2025 population?", "expected_sources": [], "expected_keywords": [], "must_refuse": true}
+{"id": "refuse-stock-price", "question": "What is Apple's current stock price?", "expected_sources": [], "expected_keywords": [], "must_refuse": true}
+{"id": "refuse-recipe", "question": "Give me a recipe for chocolate cake.", "expected_sources": [], "expected_keywords": [], "must_refuse": true}

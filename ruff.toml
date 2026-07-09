@@ -1,0 +1,11 @@
+target-version = "py311"
+line-length = 100
+
+[lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+ignore = [
+    "E501",  # line length handled by formatter/reviewer judgment, not a hard gate
+]
+
+[lint.isort]
+known-first-party = ["config", "services", "eval"]
