@@ -32,6 +32,7 @@ USAGE (run from the repo root, with the same env/.env the RAG pipeline needs —
     python eval/run_eval.py --collection <collection_id>   # scope to one collection
     python eval/run_eval.py --model my-finetuned-model-v2  # eval a different model
     python eval/run_eval.py --mlflow                       # log the scorecard to MLflow
+    python eval/run_eval.py --permissive-eval-set          # skip invalid rows (debug only)
 ======================================================================
 """
 from __future__ import annotations
@@ -108,6 +109,11 @@ def main() -> None:
         "Lets you eval several models in a row without touching .env.",
     )
     parser.add_argument("--mlflow", action="store_true", help="Also log this run to MLflow")
+    parser.add_argument(
+        "--permissive-eval-set",
+        action="store_true",
+        help="Skip invalid rows for investigation only (strict validation is the default).",
+    )
     args = parser.parse_args()
 
     # --model overrides the configured chat model for THIS process only. Every
@@ -116,7 +122,8 @@ def main() -> None:
     if args.model:
         settings.OLLAMA_CHAT_MODEL = args.model
 
-    rows = load_eval_set(Path(args.set))
+    eval_set_path = Path(args.set)
+    rows = load_eval_set(eval_set_path, strict=not args.permissive_eval_set)
     console.print(
         f"[bold]Loaded {len(rows)} eval questions[/bold] - "
         f"model=[cyan]{settings.OLLAMA_CHAT_MODEL}[/cyan] - "
@@ -136,7 +143,13 @@ def main() -> None:
 
     agg = aggregate(results)
     _print_summary(agg)
-    out_path = write_results(results, agg, Path(args.out), settings.OLLAMA_CHAT_MODEL)
+    out_path = write_results(
+        results,
+        agg,
+        Path(args.out),
+        settings.OLLAMA_CHAT_MODEL,
+        eval_set_path=eval_set_path,
+    )
     console.print(f"\nSaved -> [cyan]{out_path}[/cyan]  (diff against a prior run to see if a change helped)")
 
     if args.mlflow:

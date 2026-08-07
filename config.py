@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     # in Ollama (`ollama pull <model>`), or override with --model / this env var.
     OLLAMA_CHAT_MODEL: str = "my-finetuned-model"
     OLLAMA_EMBED_MODEL: str = "nomic-embed-text"
+    # Near-greedy decoding. An eval is only evidence if a re-run gives roughly
+    # the same numbers, so sampling stays low — and configurable here rather
+    # than hardcoded inside the chain.
+    OLLAMA_TEMPERATURE: float = 0.1
     # Deliberate, not left at Ollama's defaults: big enough for a reranked RAG
     # context; keep_alive avoids reloading the model between eval questions.
     OLLAMA_NUM_CTX: int = 4096

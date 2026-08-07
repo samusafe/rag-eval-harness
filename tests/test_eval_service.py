@@ -1,5 +1,6 @@
 """Unit tests for the pure scoring/aggregation/persistence helpers in
 services/eval_service.py — no retriever, LLM, or MLflow involved."""
+import hashlib
 import json
 
 from services.eval_service import (
@@ -41,8 +42,27 @@ def test_keyword_recall_none_when_not_scored():
     assert keyword_recall("anything", []) is None
 
 
-def test_refusal_ok_matches_exact_sentence_case_insensitive():
+def test_keyword_recall_is_lexical_not_factual():
+    # Documents the known limitation: a negated/wrong answer that still
+    # contains the expected string scores a full 1.0. Keyword recall is a
+    # content-regression signal, not a correctness judgement.
+    assert keyword_recall("The policy is NOT 20 days.", ["20 days"]) == 1.0
+
+
+def test_refusal_ok_accepts_only_formatting_differences():
+    # Normalization is limited to trim, whitespace collapsing and case.
+    assert refusal_ok(REFUSAL, True) is True
     assert refusal_ok(REFUSAL.upper(), True) is True
+    assert refusal_ok(f"  \n{REFUSAL}\t ", True) is True
+    assert refusal_ok(REFUSAL.replace(" ", "  "), True) is True
+
+
+def test_refusal_ok_rejects_answer_plus_refusal():
+    # The whole point: a hallucinated answer that also contains the refusal
+    # sentence must NOT count as a correct refusal.
+    assert refusal_ok(f"The capital is Canberra. {REFUSAL}", True) is False
+    assert refusal_ok(f"{REFUSAL} But here is what I think anyway.", True) is False
+    assert refusal_ok(f'"{REFUSAL}"', True) is False
     assert refusal_ok("I know the answer!", True) is False
 
 
@@ -89,3 +109,18 @@ def test_write_results_roundtrip(tmp_path):
     assert data["model"] == "test-model"
     assert data["summary"] == agg
     assert data["results"] == results
+    # Pre-existing keys are unchanged; run_manifest is purely additive so old
+    # scorecards stay diffable against new ones.
+    assert {"timestamp", "model", "embed_model", "summary", "results"} <= data.keys()
+    assert data["run_manifest"]["chat_model"] == "test-model"
+    # No eval_set_path passed -> explicit null, never a fabricated hash.
+    assert data["run_manifest"]["eval_set_sha256"] is None
+
+
+def test_write_results_records_the_eval_set_hash(tmp_path):
+    eval_set = tmp_path / "eval_set.jsonl"
+    eval_set.write_bytes(b"{}\n")
+    out_path = write_results([], {"n": 0}, tmp_path, "test-model", eval_set_path=eval_set)
+
+    data = json.loads(out_path.read_text(encoding="utf-8"))
+    assert data["run_manifest"]["eval_set_sha256"] == hashlib.sha256(b"{}\n").hexdigest()

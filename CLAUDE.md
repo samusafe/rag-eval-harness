@@ -46,6 +46,7 @@ pip install -r requirements-dev.txt      # + pytest, ruff
 # Run the eval (needs Postgres/pgvector + Ollama reachable — see .env.example)
 python eval/run_eval.py
 python eval/run_eval.py --model my-finetuned-model-v2 --mlflow
+python eval/run_eval.py --permissive-eval-set   # investigate a broken eval set
 
 # Compare two (or more) prior runs
 python eval/compare_runs.py --latest 2
@@ -56,8 +57,9 @@ python eval/bench_ollama.py --model my-finetuned-model --runs 5 --mlflow
 # Tests (no live services required — schema/config/import only)
 python -m pytest
 
-# Lint
+# Lint + types
 ruff check .
+python -m mypy
 ```
 
 Equivalent wrapper scripts ship for both shells: `scripts/run_eval.ps1` /
@@ -76,8 +78,9 @@ interpreter). All config is environment-driven with localhost defaults — see
 ## Tests
 
 `tests/` only covers what's true without Ollama/Postgres/MLflow running:
-eval-set schema validation, config defaults/overrides, clean module imports,
-and the pure scoring/aggregation/bench-math functions. It does NOT fake a
+eval-set schema validation (including every strict-mode rejection path),
+refusal-contract scoring, run-manifest construction, config defaults/overrides,
+clean module imports, and the pure scoring/aggregation/bench-math functions. It does NOT fake a
 passing end-to-end pipeline — there is no mock LLM pretending eval scores
 are real. Running the harness against a live model is a manual/CI-external
 step, by design (see README).
