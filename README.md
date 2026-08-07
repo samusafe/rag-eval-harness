@@ -95,6 +95,15 @@ Shell-agnostic wrappers ship for both platforms:
 `scripts/run_eval.ps1` / `scripts/run_eval.sh` and
 `scripts/compare.ps1` / `scripts/compare.sh`.
 
+`run_eval.py` reports live while it works — a spinner for the slow startup
+(vector-store handshake + cross-encoder load), then a progress bar with the
+question currently running, how many are done, elapsed time and ETA, with each
+question's result scrolling above it as it lands. A local LLM takes tens of
+seconds per question, so a silent run is indistinguishable from a hung one.
+Ctrl-C stops the run and writes **no** scorecard on purpose: a partial run
+isn't comparable against a full one, and `compare_runs.py` assumes every
+result file is complete.
+
 ### What this repo does NOT include
 
 This is the **evaluation harness**, not a full RAG service. There is no

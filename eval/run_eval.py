@@ -47,6 +47,15 @@ sys.path.insert(0, str(APP_ROOT))
 
 from langchain_core.output_parsers import StrOutputParser  # noqa: E402
 from rich.console import Console  # noqa: E402
+from rich.progress import (  # noqa: E402
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 from rich.table import Table  # noqa: E402
 
 from config import settings  # noqa: E402
@@ -130,16 +139,46 @@ def main() -> None:
         f"embed=[cyan]{settings.OLLAMA_EMBED_MODEL}[/cyan]\n"
     )
 
-    # Reuse the REAL pipeline components.
-    prompt, llm, get_retriever = get_rag_chain()
-    retriever = get_retriever(args.collection)
-    chain = prompt | llm | StrOutputParser()
+    # Reuse the REAL pipeline components. Building them is itself slow the first
+    # time (vector-store handshake + cross-encoder load/download), so it gets its
+    # own spinner — otherwise the run looks hung before question 1 even starts.
+    with console.status("[cyan]Connecting to vector store and loading reranker...[/cyan]"):
+        prompt, llm, get_retriever = get_rag_chain()
+        retriever = get_retriever(args.collection)
+        chain = prompt | llm | StrOutputParser()
 
+    # A local LLM answers in tens of seconds, so a bare loop looks frozen for
+    # minutes on end. Live progress (which question is running, how many are
+    # done, elapsed, ETA) is the difference between "it's working" and "is it
+    # stuck?" — the per-question result lines still scroll above the bar.
     results: list[dict] = []
-    for row in rows:
-        r = _eval_one(row, retriever, chain)
-        results.append(r)
-        _print_row(r)
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+        transient=True,
+    )
+    try:
+        with progress:
+            task = progress.add_task("Evaluating", total=len(rows))
+            for row in rows:
+                progress.update(task, description=f"[cyan]{row.id}[/cyan]")
+                r = _eval_one(row, retriever, chain)
+                results.append(r)
+                _print_row(r)
+                progress.advance(task)
+    except KeyboardInterrupt:
+        # Deliberately no scorecard on a partial run: compare_runs.py treats
+        # every result file as a complete run, and a half-finished one would
+        # quietly produce a wrong-looking regression.
+        raise SystemExit(
+            f"Interrupted after {len(results)}/{len(rows)} questions - no scorecard "
+            "written (a partial run isn't comparable against a full one)."
+        ) from None
 
     agg = aggregate(results)
     _print_summary(agg)
