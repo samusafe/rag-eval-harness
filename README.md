@@ -1,222 +1,208 @@
+<p align="center">
+  <img src="assets/rag-eval-harness-banner.png" alt="RAG Eval Harness — never ship a RAG change unmeasured" width="100%">
+</p>
+
+<div align="center">
+
 # RAG Eval Harness
 
-![CI](https://github.com/samusafe/rag-eval-harness/actions/workflows/ci.yml/badge.svg)
+### Never ship a RAG change unmeasured
 
-A small, honest evaluation harness for a local Retrieval-Augmented Generation
-(RAG) pipeline. It runs a fixed question set through the **real** chain —
-pgvector similarity search, a cross-encoder reranker, prompt assembly, and a
-local Ollama chat model — and scores the answers on the axes that actually
-decide whether a RAG system is any good. Then it lets you diff two runs to
-see whether a change (new model, LoRA adapter, prompt, chunking, embedder)
-made things better or worse, instead of guessing from a handful of manual
-spot-checks.
+[![CI](https://github.com/samusafe/rag-eval-harness/actions/workflows/ci.yml/badge.svg)](https://github.com/samusafe/rag-eval-harness/actions/workflows/ci.yml)
+[![Status: Open Source Alpha](https://img.shields.io/badge/status-open--source%20alpha-2563eb?style=flat-square)](#project-status)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776ab?style=flat-square&logo=python&logoColor=white)](#requirements)
+[![Local stack](https://img.shields.io/badge/stack-Ollama%20%2B%20pgvector-0ea5e9?style=flat-square)](#architecture)
+[![License: MIT](https://img.shields.io/badge/license-MIT-16a34a?style=flat-square)](LICENSE)
 
-## Why evals matter
+Run a fixed question set through your **real** RAG chain. Score retrieval, answer keyword recall, refusal accuracy and latency. Diff two runs and see whether the change actually helped.
 
-RAG has a lot of knobs that all sound plausible in isolation: swap the
-generator, tweak the prompt, change chunk size, fine-tune an adapter, add a
-reranker. Every one of them can silently make retrieval worse, recall worse,
-or hallucination more likely — while looking fine on the two questions you
-happened to try by hand.
+**[Quick start](#quick-start)** · **[Architecture](#architecture)** · **[Metrics](#metrics)** · **[Provenance](#run-provenance)** · **[Another RAG over HTTP](#pointing-the-harness-at-another-rag-http-target)**
 
-**The rule this repo encodes: never ship a RAG change unmeasured.** Run the
-eval before the change, run it after, and diff the scorecards
-(`compare_runs.py`). If a change can't show its work in a scorecard, it
-doesn't ship.
+</div>
+
+> [!WARNING]
+> **This is not a factuality benchmark.** Every metric here is a deterministic, lexical regression signal — it tells you whether a change moved the system, not whether an answer is true. There is no LLM-as-judge, on purpose. Read [what these metrics are not](#what-these-metrics-are-not) before quoting a number anywhere.
+
+## Why it exists
+
+RAG has a lot of knobs that all sound plausible in isolation: swap the generator, tweak the prompt, change chunk size, fine-tune an adapter, add a reranker. Every one of them can silently make retrieval worse, recall worse, or hallucination more likely — while looking fine on the two questions you happened to try by hand.
+
+**The rule this repo encodes: run the eval before the change, run it after, diff the scorecards.** If a change can't show its work in a scorecard, it doesn't ship.
+
+## Highlights
+
+| Capability | What it does |
+| --- | --- |
+| Scores the real chain | No mock LLM, no fixture answers — questions go through the same pgvector search, cross-encoder reranker, prompt and local Ollama model your app uses. |
+| Anti-hallucination signal | `must_refuse` rows check that out-of-KB questions produce the exact refusal sentence and nothing else, so an answer-plus-refusal cannot pass. |
+| Fail-closed eval set | Rows are strictly typed and validated; a malformed row aborts the run instead of silently shrinking the question set. |
+| Reproducible scorecards | Every result JSON carries a `run_manifest`: git SHA and dirty flag, eval-set hash, model names, retrieval knobs, prompt and config hashes. |
+| Run-to-run diffing | `compare_runs.py` prints a summary delta and a per-question breakdown, regressions first, and warns when two runs used different embedders. |
+| Live progress | A spinner over the slow startup, then a progress bar with the running question, elapsed time and ETA — a silent run is indistinguishable from a hung one. |
+| Experiment tracking | Optional MLflow logging puts models, adapters and prompt versions side by side across many runs, not just the two most recent. |
 
 ## Architecture
 
-```
-                     ┌─────────────────────┐
-  eval_set.jsonl ──► │  eval/run_eval.py    │  (CLI: argparse, rich scorecard)
-                     └──────────┬──────────┘
-                                │ drives
-                                ▼
-                     ┌─────────────────────┐
-                     │ services/eval_service│  scoring + persistence core
-                     │  - load_eval_set      │  (dependency-light, unit-tested)
-                     │  - retrieval_hit      │
-                     │  - keyword_recall     │
-                     │  - refusal_ok         │
-                     │  - aggregate          │
-                     │  - write_results      │
-                     │  - log_mlflow ────────┼──► MLflow (:5000)
-                     └──────────┬──────────┘
-                                │ per question
-                                ▼
-                     ┌─────────────────────┐
-                     │ services/rag_chain   │  the actual RAG chain (LCEL)
-                     └──────────┬──────────┘
-             ┌──────────────────┼──────────────────┐
-             ▼                  ▼                  ▼
-  services/vector_store   cross-encoder        ChatOllama
-   (pgvector similarity)   reranker (top-N)    (local LLM, :11434)
-   OllamaEmbeddings
-
-  eval/results/*.json ──► eval/compare_runs.py ──► summary + per-question
-                                                     regressions (rich table)
-
-  eval/bench_ollama.py ──► services/bench_core (pure tok/s math) ──► MLflow
-   (raw Ollama throughput, separate from RAG quality)
+```mermaid
+flowchart LR
+    S[eval_set.jsonl] --> E[services/eval_service]
+    E --> C[services/rag_chain LCEL]
+    C --> V[(PostgreSQL + pgvector)]
+    C --> X[Cross-encoder reranker]
+    C --> O[Local Ollama]
+    E --> J[eval/results/*.json + run_manifest]
+    J --> D[eval/compare_runs.py]
+    J --> M[MLflow]
 ```
 
-Everything is local: Ollama for both the chat model and the embeddings, no
-cloud LLM provider anywhere in this repo.
+```text
+config.py                  Single source of truth for every env-driven setting
+services/
+  vector_store.py          pgvector connection + Ollama embeddings (singletons)
+  rag_chain.py             Retriever + reranker + prompt + LLM (LCEL)
+  eval_service.py          Validation, scoring, aggregation, manifest, persistence
+  bench_core.py            Pure tok/s math (no I/O)
+eval/
+  run_eval.py              CLI: run the eval, print a rich scorecard
+  compare_runs.py          CLI: diff two or more scorecards
+  bench_ollama.py          CLI: raw Ollama throughput benchmark
+  eval_set.example.jsonl   Synthetic example question set
+  results/                 Run output JSON (gitignored)
+scripts/                   .ps1 / .sh twins for the above
+tests/                     Offline tests — no live services required
+```
 
-## Quickstart
+Everything is local: Ollama for both the chat model and the embeddings. No cloud LLM provider anywhere in this repo.
 
-Prerequisites: Python 3.11+, a reachable [Ollama](https://ollama.com) with a
-chat model and an embedding model pulled, and a Postgres instance with the
-`pgvector` extension and a `rag_documents` collection already populated by
-*some* ingestion pipeline (see "What this repo does NOT include" below).
+## Quick start
+
+### Requirements
+
+- Python 3.11+
+- A reachable [Ollama](https://ollama.com) with a chat model and an embedding model pulled
+- PostgreSQL with the `pgvector` extension and a populated `rag_documents` collection
+- MLflow, only if you want `--mlflow` tracking
+
+### 1. Install
+
+<details open>
+<summary>macOS / Linux</summary>
 
 ```bash
-# 1. Install
 python -m venv .venv
-. .venv/Scripts/activate        # Windows PowerShell: .venv\Scripts\Activate.ps1
+source .venv/bin/activate
 pip install -r requirements.txt
+```
 
-# 2. Configure (every value has a localhost default — only override what you need)
+</details>
+
+<details>
+<summary>Windows PowerShell</summary>
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+</details>
+
+### 2. Configure
+
+```bash
 cp .env.example .env
+```
 
-# 3. Run the eval
+Every value already has a localhost default in `config.py` — `.env` is only needed to override something.
+
+### 3. Run the eval
+
+```bash
 python eval/run_eval.py
-# or, for a specific model / with MLflow logging:
-python eval/run_eval.py --model my-finetuned-model --mlflow
+python eval/run_eval.py --model my-finetuned-model-v2 --mlflow   # A/B a different model
+python eval/run_eval.py --collection <collection_id>             # scope to one collection
+```
 
-# 4. Compare against a previous run
+### 4. Compare against a previous run
+
+```bash
 python eval/compare_runs.py --latest 2
+python eval/compare_runs.py eval/results/<baseline>.json eval/results/<candidate>.json
+```
 
-# 5. (optional) Benchmark raw Ollama throughput
+For exactly two runs it also prints a per-question breakdown, **regressions first** — that is where the debugging value is. If the two runs used different embedders it warns that retrieval hit-rate is not comparable between them.
+
+### 5. (optional) Benchmark raw Ollama throughput
+
+```bash
 python eval/bench_ollama.py --model my-finetuned-model --runs 5 --mlflow
 ```
 
-Shell-agnostic wrappers ship for both platforms:
-`scripts/run_eval.ps1` / `scripts/run_eval.sh` and
-`scripts/compare.ps1` / `scripts/compare.sh`.
+Shell wrappers ship for both platforms: `scripts/run_eval.ps1` / `scripts/run_eval.sh` and `scripts/compare.ps1` / `scripts/compare.sh`.
 
-`run_eval.py` reports live while it works — a spinner for the slow startup
-(vector-store handshake + cross-encoder load), then a progress bar with the
-question currently running, how many are done, elapsed time and ETA, with each
-question's result scrolling above it as it lands. A local LLM takes tens of
-seconds per question, so a silent run is indistinguishable from a hung one.
-Ctrl-C stops the run and writes **no** scorecard on purpose: a partial run
-isn't comparable against a full one, and `compare_runs.py` assumes every
-result file is complete.
+> [!NOTE]
+> Ctrl-C stops a run and writes **no** scorecard, on purpose: `compare_runs.py` treats every result file as a complete run, so a half-finished one would quietly read as a regression.
 
 ### What this repo does NOT include
 
-This is the **evaluation harness**, not a full RAG service. There is no
-document ingestion pipeline here (chunking, OCR, upload API) — you bring your
-own already-populated `pgvector` collection, or point `services/vector_store.py`
-at whatever vector store your own RAG stack already uses. The eval set
-(`eval/eval_set.example.jsonl`) ships with synthetic questions about a
-fictional company handbook so the schema is obvious; swap in your own
-questions and source-document substrings once you've ingested real docs.
+This is the **evaluation harness**, not a full RAG service. There is no ingestion pipeline here (chunking, OCR, upload API) — you bring your own populated `pgvector` collection, or point `services/vector_store.py` at whatever vector store your stack already uses. The shipped eval set contains synthetic questions about a fictional company handbook so the schema is obvious; swap in your own once you have ingested real documents.
 
-## Eval set schema (`eval/eval_set.example.jsonl`, one JSON object per line)
+## Eval set
+
+One JSON object per line, in `eval/eval_set.example.jsonl`. Lines starting with `//` are comments.
 
 | Field | Meaning |
-|---|---|
-| `id` | short, unique label |
-| `question` | the user question |
-| `expected_sources` | substrings expected in a retrieved chunk's `source_file` metadata (retrieval hit). Empty list = not scored |
-| `expected_keywords` | strings the answer should contain (keyword recall). Empty list = not scored |
-| `must_refuse` | `true` for out-of-KB questions — the answer must be the exact refusal sentence |
-| `expected_source_ids` | *optional, reserved* — exact chunk/document IDs for a future exact-match retrieval metric. Accepted and stored today, not scored yet |
+| --- | --- |
+| `id` | Short, unique label. Also the join key `compare_runs.py` diffs on |
+| `question` | The user question |
+| `expected_sources` | Substrings expected in a retrieved chunk's `source_file` metadata. Empty list = retrieval not scored |
+| `expected_keywords` | Strings the answer should contain. Empty list = recall not scored |
+| `must_refuse` | `true` for out-of-KB questions — the answer must be exactly the refusal sentence |
+| `expected_source_ids` | *Optional, reserved.* Exact chunk/document IDs for a future exact-match retrieval metric. Accepted and stored today, not scored yet |
 
-Lines starting with `//` are treated as comments and skipped by the loader.
-Include several `must_refuse: true` rows — those are what catch hallucination,
-the highest-risk RAG failure mode.
+Include several `must_refuse: true` rows — those are what catch hallucination, the highest-risk RAG failure mode.
 
 ### Strict by default
 
-An eval set is a measuring instrument, so the loader is **fail-closed**: a bad
-row aborts the run instead of silently shrinking the question set (which would
-move every rate in the scorecard while the run still looked green). A row is
-rejected — naming file, line number and cause — when it:
+An eval set is a measuring instrument, so the loader is **fail-closed**: a bad row aborts the run instead of silently shrinking the question set, which would move every rate in the scorecard while the run still looked green. A row is rejected — naming file, line number and cause — when it:
 
-- isn't valid JSON,
-- is missing a required field, or has the wrong type (no coercion: `"true"` is
-  not `true`, `1` is not `"1"`),
-- has a blank `id` or `question`,
-- carries an unknown key (a typo like `expected_keyword` would otherwise score
-  nothing, silently),
+- is not valid JSON;
+- is missing a required field, or has the wrong type (no coercion: `"true"` is not `true`, `1` is not `"1"`);
+- has a blank `id` or `question`;
+- carries an unknown key (a typo like `expected_keyword` would otherwise score nothing, silently);
 - reuses an `id` already seen in the file.
 
 ```bash
 python eval/run_eval.py --permissive-eval-set   # log + skip bad rows instead
 ```
 
-`--permissive-eval-set` exists only to investigate a broken file. It still
-raises if nothing valid is left, and its numbers are not comparable against a
-strict run.
+`--permissive-eval-set` exists only to investigate a broken file. It still raises when nothing valid is left, and its numbers are not comparable against a strict run.
 
-## Metrics explained
+## Metrics
 
-Computed in `services/eval_service.py`, printed by `eval/run_eval.py`:
+Computed in `services/eval_service.py`, printed by `eval/run_eval.py`. Each metric averages only over the rows where it applies, so a mixed eval set never dilutes either number.
 
-- **Retrieval hit-rate** (target ≥ 0.80) — did a retrieved chunk's
-  `source_file` contain one of the row's `expected_sources` substrings, after
-  reranking? Bad retrieval caps everything downstream — the generator can't
-  answer from a document it never saw.
-- **Answer keyword recall** (target ≥ 0.70) — fraction of `expected_keywords`
-  present in the generated answer (case-insensitive substring match). A cheap
-  regression signal on answer content.
-- **Refusal accuracy** (target ≥ 0.90) — for `must_refuse` rows, is the
-  **whole answer** the configured refusal sentence? This is the
-  anti-hallucination signal.
-- **Median latency** — wall-clock seconds per question (retrieval + rerank +
-  generation). Your speed baseline; watch it whenever you swap models or
-  retrieval knobs.
+| Metric | Target | Meaning |
+| --- | ---: | --- |
+| Retrieval hit-rate | >= 0.80 | A retrieved chunk's `source_file` contains one of the row's `expected_sources`, after reranking. Bad retrieval caps everything downstream. |
+| Answer keyword recall | >= 0.70 | Fraction of `expected_keywords` present in the answer, case-insensitive. |
+| Refusal accuracy | >= 0.90 | For `must_refuse` rows, the whole answer is the configured refusal sentence. The anti-hallucination signal. |
+| Median latency | — | Wall-clock seconds per question (retrieval + rerank + generation). Your speed baseline. |
 
-Each metric only averages over the rows where it applies — a `must_refuse`
-row doesn't get scored on retrieval/keywords, and an in-KB row doesn't get
-scored on refusal accuracy — so a mixed eval set never dilutes either number.
+No baseline scorecard is published here on purpose: the numbers depend entirely on your corpus, embedder and generator, so a figure from this repo's synthetic set would be meaningless for yours.
 
 ### What these metrics are not
 
-Being explicit about this matters more than the numbers themselves:
+Being explicit about this matters more than the numbers themselves.
 
-- **Keyword recall is lexical, not factual.** It checks that strings appear,
-  not that the answer is true. *"The policy is **not** 20 days"* scores a full
-  1.0 against `["20 days"]`. Read it as "did the answer keep talking about the
-  right things", never as a correctness or hallucination score.
-- **Retrieval hit-rate is substring matching over file names**, not exact
-  chunk identity. It tolerates the path/extension noise real ingestion
-  pipelines produce, at the cost of counting a coincidental name match as a
-  hit. `expected_source_ids` is the reserved slot for the exact-match version.
-- **Refusal accuracy is exact, after whitespace/case normalization only.** The
-  entire answer must equal the refusal sentence; trailing newlines, doubled
-  spaces and capitalization are forgiven, added words are not. A substring
-  test would score *"The capital is Canberra. I don't have enough information
-  in the knowledge base to answer this question."* as a correct refusal — i.e.
-  it would grade a hallucination as anti-hallucination.
-- **There is no LLM-as-judge here, on purpose.** Every metric is
-  deterministic, so re-running the same set against the same model moves the
-  numbers only when the system changed, not when the judge felt different.
+- **Keyword recall is lexical, not factual.** It checks that strings appear, not that the answer is true. *"The policy is **not** 20 days"* scores a full 1.0 against `["20 days"]`. Read it as "did the answer keep talking about the right things", never as a correctness score.
+- **Retrieval hit-rate is substring matching over file names**, not exact chunk identity. It tolerates the path and extension noise real ingestion pipelines produce, at the cost of counting a coincidental name match as a hit. `expected_source_ids` is the reserved slot for the exact-match version.
+- **Refusal accuracy is exact, after whitespace and case normalization only.** The entire answer must equal the refusal sentence; trailing newlines, doubled spaces and capitalization are forgiven, added words are not. A substring test would score *"The capital is Canberra. I don't have enough information in the knowledge base to answer this question."* as a correct refusal — grading a hallucination as anti-hallucination.
+- **There is no LLM-as-judge.** Every metric is deterministic, so re-running the same set against the same model moves the numbers only when the system changed, not when the judge felt different.
 
-## Comparing runs
+## Run provenance
 
-Each run writes `eval/results/eval_<model>_<timestamp>.json`. Use
-`compare_runs.py` to diff them:
-
-```bash
-python eval/compare_runs.py --latest 2                                # 2 newest runs
-python eval/compare_runs.py eval/results/<old>.json eval/results/<new>.json
-python eval/compare_runs.py --latest 3                                # summary across 3 runs
-```
-
-For exactly two runs it also prints a per-question breakdown, **regressions
-first** — that's where the debugging value is. If the two runs used different
-embedders, it warns that retrieval-hit isn't comparable between them (only
-keyword recall / refusal accuracy / latency are, since those move with the
-generator, not the embedder).
-
-## Run provenance (`run_manifest`)
-
-A score is only evidence if you can say what produced it. Every scorecard
-carries a `run_manifest` block answering exactly that:
+A score is only evidence if you can say what produced it. Every scorecard carries a `run_manifest`:
 
 ```json
 {
@@ -236,32 +222,22 @@ carries a `run_manifest` block answering exactly that:
 }
 ```
 
-Why each field earns its place:
+| Field | Why it earns its place |
+| --- | --- |
+| `git.commit_sha` / `git.dirty` | Which code ran, and whether it was a clean checkout. **`dirty: true` means the scorecard is not reproducible.** |
+| `eval_set_sha256` | The exact question-set bytes. Two runs are only comparable when this matches. |
+| `prompt_sha256` / `config_sha256` | Catches the silent killers — an edited prompt or a changed `RETRIEVAL_TOP_K` that would otherwise look like the model got better. |
+| Model names, `retrieval`, `python_version`, `timestamp_utc` | The rest of the environment, in one place. |
 
-- `git.commit_sha` / `git.dirty` — which code ran, and whether it was a clean
-  checkout. **`dirty: true` means the scorecard is not reproducible.**
-- `eval_set_sha256` — the exact question-set bytes. Two runs are only
-  comparable when this matches.
-- `prompt_sha256` / `config_sha256` — catches the silent killers: an edited
-  prompt or a changed `RETRIEVAL_TOP_K` that would otherwise look like the
-  model got better.
-- model names, `retrieval`, `python_version`, `timestamp_utc` — the rest of
-  the environment, in one place.
+Git metadata is **best-effort and never fatal**: running from a tarball, a container, or a machine without git yields explicit `null`s — `dirty: null` means *unknown*, not *clean* — rather than an error or a fabricated value. The whole block is additive, so older result files still diff against newer ones.
 
-Git metadata is **best-effort and never fatal**: running from a tarball, a
-container, or a machine without git yields explicit `null`s (`dirty: null`
-means *unknown*, not *clean*) rather than an error or a fabricated value.
+## MLflow
 
-The block is purely additive — every pre-existing scorecard key is unchanged,
-so older result files still diff against newer ones in `compare_runs.py`.
+`--mlflow` on `run_eval.py` and `bench_ollama.py` logs params, metrics and the scorecard JSON (manifest included) as an artifact to a local MLflow tracking server — `MLFLOW_TRACKING_URI`, default `http://localhost:5000`, under the `MLFLOW_EXPERIMENT_NAME` / `MLFLOW_BENCH_EXPERIMENT_NAME` experiments. Tracking failures are logged and never break the eval itself.
 
 ## Pointing the harness at another RAG (HTTP target)
 
-Nothing about the scoring core is Ollama-specific. `_eval_one` only needs two
-things: a retriever with `.invoke(question) -> [docs with .metadata["source_file"]]`
-and a chain with `.invoke({...}) -> str`. Adapt any RAG service behind an HTTP
-API by adding one module (keep the HTTP client in `services/`, per the
-dependencies-point-inward rule — never inline in a CLI script):
+Nothing about the scoring core is Ollama-specific. `_eval_one` needs exactly two things: a retriever with `.invoke(question) -> [docs with .metadata["source_file"]]`, and a chain with `.invoke({...}) -> str`. Adapt any RAG service behind an HTTP API by adding one module — keep the HTTP client in `services/`, never inline in a CLI script:
 
 ```python
 # services/http_rag_target.py
@@ -297,9 +273,6 @@ class HttpRagTarget:
             for chunk in self._last.get("sources", [])
         ]
 
-    def as_chain(self) -> "HttpRagTarget":
-        return self                          # chain side, below
-
     def invoke_chain(self, _inputs: dict) -> str:
         return self._last.get("answer", "")
 ```
@@ -311,77 +284,48 @@ target = HttpRagTarget("http://localhost:8000")
 retriever, chain = target, SimpleNamespace(invoke=target.invoke_chain)
 ```
 
-Three caveats before you trust the output:
+Three caveats before trusting the output:
 
-1. **Retrieval hit-rate needs the API to return its sources.** If yours only
-   returns an answer, leave `expected_sources` empty and score keyword recall
-   and refusal accuracy only — an unscored metric is honest, a fake one isn't.
-2. **Latency becomes the full remote round trip**, including that service's
-   own queueing — not comparable against local-chain runs.
-3. **The refusal sentence must match.** Either make the remote service emit
-   the sentence in `REFUSAL` verbatim, or change `REFUSAL` in
-   `services/eval_service.py` to whatever contract that service promises.
-   Refusal accuracy measures adherence to a contract; there has to be one.
+1. **Retrieval hit-rate needs the API to return its sources.** If yours only returns an answer, leave `expected_sources` empty and score keyword recall and refusal accuracy only — an unscored metric is honest, a fake one is not.
+2. **Latency becomes the full remote round trip**, including that service's own queueing. Not comparable against local-chain runs.
+3. **The refusal sentence must match.** Either make the remote service emit the sentence in `REFUSAL` verbatim, or change `REFUSAL` in `services/eval_service.py` to whatever contract that service promises. Refusal accuracy measures adherence to a contract; there has to be one.
 
-## MLflow
+## Project status
 
-`--mlflow` on `run_eval.py` and `bench_ollama.py` logs params + metrics +
-the scorecard JSON as an artifact to a local MLflow tracking server
-(`MLFLOW_TRACKING_URI`, default `http://localhost:5000`), under the
-`MLFLOW_EXPERIMENT_NAME` / `MLFLOW_BENCH_EXPERIMENT_NAME` experiments. This
-is what lets several models/adapters/prompt versions sit side-by-side across
-runs, not just the two most recent.
-
-<!-- MLflow screenshots: drop PNGs of the experiment view / run comparison
-     here once you have real eval runs against your own model + docs. -->
-
-## Project layout
-
-```
-config.py                   # single source of truth for every env-driven setting
-services/
-  vector_store.py           # pgvector connection + Ollama embeddings (singletons)
-  rag_chain.py               # retriever + reranker + prompt + LLM (LCEL)
-  eval_service.py             # scoring, aggregation, persistence, MLflow logging
-  bench_core.py                # pure tok/s math (no I/O — easy to unit-test)
-eval/
-  run_eval.py                # CLI: run the eval, print a rich scorecard
-  compare_runs.py             # CLI: diff two or more scorecards
-  bench_ollama.py             # CLI: raw Ollama throughput benchmark
-  eval_set.example.jsonl      # synthetic example question set
-  results/                    # eval run JSON output (gitignored)
-scripts/                     # .ps1 / .sh twins for the above
-tests/                       # schema/config/import/pure-function tests (no live services)
-```
+| Area | Current state | Before relying on it elsewhere |
+| --- | --- | --- |
+| Eval, compare and bench flows | Implemented, offline-tested | Record a baseline scorecard against your own corpus and model. |
+| Eval-set validation | Fail-closed and typed, every rejection path covered by tests | Migrate your own eval set — unknown keys are rejected by design. |
+| Reproducibility | `run_manifest` per run, pinned dependency ranges, near-greedy decoding | Pin Ollama model tags by digest; tags are mutable, so a "same model" rerun is not guaranteed identical. |
+| Metrics | Deterministic lexical and refusal metrics, no LLM-as-judge | Add exact-ID retrieval scoring via `expected_source_ids` if file-name matching is too loose for you. |
+| CI and static checks | Ruff, mypy and pytest on every push and pull request | Add release automation and protected-branch rules. |
+| Tests | Offline only, by design — no live services faked | Live-model runs stay a manual step against your own stack. |
 
 ## Development
 
 ```bash
 pip install -r requirements-dev.txt
-ruff check .        # lint (ruff.toml)
-python -m mypy      # types  (mypy.ini)
+ruff check .        # lint  (ruff.toml)
+python -m mypy      # types (mypy.ini)
 python -m pytest
 ```
 
-Type checking is deliberately pragmatic, not strict: mypy's default only
-checks annotated functions, which covers the typed core (eval-set loading,
-metrics, run manifest) without demanding a codebase-wide annotation pass. The
-one blanket exemption is `ignore_missing_imports` — the LangChain / Ollama /
-pgvector / MLflow stack ships no usable type information and has no stub
-packages.
+Type checking is deliberately pragmatic, not strict: mypy's default only checks annotated functions, which covers the typed core (eval-set loading, metrics, run manifest) without demanding a codebase-wide annotation pass. The one blanket exemption is `ignore_missing_imports` — the LangChain / Ollama / pgvector / MLflow stack ships no usable type information and has no stub packages.
 
-CI (`.github/workflows/ci.yml`) runs ruff + mypy + pytest on every push/PR
-against a plain `ubuntu-latest` runner with **no Ollama, Postgres, or MLflow
-present** — the test suite is scoped to exactly what that allows (eval-set
-validation and its rejection paths, refusal-contract scoring, run-manifest
-construction, config defaults, clean imports, pure scoring/bench math). It
-does **not** fake a passing end-to-end pipeline; running the harness against a
-live model is a manual step against your own local stack.
+CI (`.github/workflows/ci.yml`) runs all three on a plain `ubuntu-latest` runner with **no Ollama, Postgres or MLflow present**. The suite is scoped to exactly what that allows: eval-set validation and its rejection paths, refusal-contract scoring, run-manifest construction, config defaults, clean imports, and the pure scoring and bench math. It does **not** fake a passing end-to-end pipeline — there is no mock LLM pretending eval scores are real.
+
+## Design rules
+
+The repo is small on purpose and stays that way: **KISS > SOLID > YAGNI**. One file, one responsibility. No new abstraction until the second real duplication. No `except` that swallows an error without re-raising or logging the cause. Every config value lives in `config.py` and nowhere else. Dependencies point inward: CLI scripts → `services/` → clients. The full set is in [CLAUDE.md](CLAUDE.md).
+
+## Contributing
+
+Issues and pull requests are welcome. Keep changes focused, add tests that run offline, and update this README whenever a public interface, metric definition or result-schema field changes.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+[MIT](LICENSE)
 
 ---
 
-*Extracted from LocalVault, a private on-premise AI platform I'm building.*
+*Extracted and sanitized from LocalVault, a private on-premise AI platform I'm building.*
