@@ -123,6 +123,17 @@ python eval/run_eval.py --model my-finetuned-model-v2 --mlflow   # A/B a differe
 python eval/run_eval.py --collection <collection_id>             # scope to one collection
 ```
 
+Gate a run in CI or a promotion pipeline — exit code `2` when any threshold is
+missed, after the scorecard is written (a failed gate still leaves a full
+result file to diff):
+
+```bash
+python eval/run_eval.py   --gate-hit-rate 0.8 --gate-recall 0.6 --gate-refusal 0.9 --gate-max-latency 8
+```
+
+This is also the hook for [qlora-8gb-pipeline](https://github.com/samusafe/qlora-8gb-pipeline):
+run it against a freshly exported GGUF and a non-zero exit blocks the promotion.
+
 ### 4. Compare against a previous run
 
 ```bash

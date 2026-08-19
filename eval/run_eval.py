@@ -66,6 +66,7 @@ from services.eval_service import (  # noqa: E402
     log_mlflow,
     write_results,
 )
+from services.gates import check_gates  # noqa: E402
 from services.rag_chain import get_rag_chain  # noqa: E402
 
 console = Console()
@@ -123,6 +124,17 @@ def main() -> None:
         action="store_true",
         help="Skip invalid rows for investigation only (strict validation is the default).",
     )
+    # CI / promotion gates: exit 2 when the scorecard misses a threshold, so a
+    # pipeline (GitHub Actions, or qlora-8gb-pipeline's post-export check) can
+    # block a regressed model without parsing output.
+    parser.add_argument("--gate-hit-rate", type=float, default=None, metavar="0.8",
+                        help="Fail unless retrieval_hit_rate >= this")
+    parser.add_argument("--gate-recall", type=float, default=None, metavar="0.6",
+                        help="Fail unless answer_keyword_recall >= this")
+    parser.add_argument("--gate-refusal", type=float, default=None, metavar="0.9",
+                        help="Fail unless refusal_accuracy >= this")
+    parser.add_argument("--gate-max-latency", type=float, default=None, metavar="8.0",
+                        help="Fail if median_latency_s exceeds this (seconds)")
     args = parser.parse_args()
 
     # --model overrides the configured chat model for THIS process only. Every
@@ -193,6 +205,27 @@ def main() -> None:
 
     if args.mlflow:
         log_mlflow(agg, settings.OLLAMA_CHAT_MODEL, out_path)
+
+    # Gates run LAST: the scorecard is already written and logged, so a failed
+    # gate still leaves a full result file to diff against.
+    minimums = {
+        key: threshold
+        for key, threshold in (
+            ("retrieval_hit_rate", args.gate_hit_rate),
+            ("answer_keyword_recall", args.gate_recall),
+            ("refusal_accuracy", args.gate_refusal),
+        )
+        if threshold is not None
+    }
+    maximums = {"median_latency_s": args.gate_max_latency} if args.gate_max_latency is not None else {}
+    if minimums or maximums:
+        failures = check_gates(agg, minimums, maximums)
+        if failures:
+            console.print("\n[bold red]GATE FAILURES[/bold red]")
+            for failure in failures:
+                console.print(f"  [red]x[/red] {failure}")
+            raise SystemExit(2)
+        console.print("\n[bold green]All gates passed.[/bold green]")
 
 
 if __name__ == "__main__":
