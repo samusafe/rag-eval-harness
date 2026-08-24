@@ -27,6 +27,7 @@ APP_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(APP_ROOT))
 
 from rich.console import Console  # noqa: E402
+from rich.markup import escape  # noqa: E402
 from rich.table import Table  # noqa: E402
 
 console = Console()
@@ -34,8 +35,13 @@ console = Console()
 # (summary key, label, higher_is_better)
 SUMMARY_METRICS = [
     ("retrieval_hit_rate", "Retrieval hit-rate", True),
+    ("exact_retrieval_hit_rate", "Exact retrieval hit-rate", True),
+    ("mean_reciprocal_rank", "Mean reciprocal rank", True),
     ("answer_keyword_recall", "Answer keyword recall", True),
     ("refusal_accuracy", "Refusal accuracy", True),
+    ("answerability_accuracy", "Answerability accuracy", True),
+    ("citation_coverage", "Citation coverage", True),
+    ("citation_validity", "Citation validity", True),
     ("median_latency_s", "Median latency (s)", False),
 ]
 
@@ -49,14 +55,21 @@ PQ_METRICS = [
 
 
 def load_run(path: Path) -> dict:
-    data = json.loads(path.read_text(encoding="utf-8"))
-    data["_label"] = f"{data.get('model', '?')} @ {data.get('timestamp', '?')}"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise SystemExit(f"Cannot load scorecard {path}: {error}") from error
+    if not isinstance(data, dict) or not isinstance(data.get("summary"), dict) or not isinstance(data.get("results"), list):
+        raise SystemExit(f"Invalid scorecard {path}: expected object with summary and results")
+    data["_label"] = escape(f"{data.get('model', '?')} @ {data.get('timestamp', '?')}")
     data["_file"] = path.name
     return data
 
 
 def pick_latest(out_dir: Path, n: int) -> list[Path]:
     # Filenames embed a sortable %Y%m%d_%H%M%S stamp, so name sort == chronological.
+    if n < 2:
+        raise SystemExit("--latest must be at least 2.")
     files = sorted(out_dir.glob("eval_*.json"))
     if len(files) < n:
         raise SystemExit(f"Need {n} result files in {out_dir}, found {len(files)}.")
@@ -133,6 +146,49 @@ def per_question_diff(base: dict, cand: dict) -> tuple[list, list, list]:
     return rows, only_base, only_cand
 
 
+def compatibility_issues(base: dict, candidate: dict) -> tuple[list[str], list[str]]:
+    """Return (blocking, advisory) provenance differences."""
+    left = base.get("run_manifest")
+    right = candidate.get("run_manifest")
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return ["one or both scorecards have no run_manifest"], []
+
+    blocking_paths = (
+        ("eval_set_sha256",),
+        ("prompt_sha256",),
+        ("embedding_model",),
+        ("reranker_model",),
+        ("reranker", "revision"),
+        ("retrieval",),
+        ("runtime", "ollama_embedding_model", "digest"),
+    )
+    advisory_paths = (
+        ("generation",),
+        ("runtime", "ollama_chat_model", "digest"),
+        ("runtime", "ollama_chat_model", "quantization_level"),
+        ("runtime", "packages"),
+        ("runtime", "gpus"),
+    )
+
+    def value(data: dict, path: tuple[str, ...]):
+        current: object = data
+        for key in path:
+            if not isinstance(current, dict):
+                return None
+            current = current.get(key)
+        return current
+
+    def differences(paths: tuple[tuple[str, ...], ...]) -> list[str]:
+        issues = []
+        for path in paths:
+            left_value, right_value = value(left, path), value(right, path)
+            if left_value != right_value:
+                issues.append(f"{'.'.join(path)} differs: {left_value!r} vs {right_value!r}")
+        return issues
+
+    return differences(blocking_paths), differences(advisory_paths)
+
+
 def print_per_question(rows: list, only_base: list, only_cand: list) -> None:
     if rows:
         t = Table(title="Per-question changes (regressions first)", header_style="bold cyan")
@@ -142,15 +198,16 @@ def print_per_question(rows: list, only_base: list, only_cand: list) -> None:
         t.add_column("base -> cand", justify="right")
         for improved, i, key, label, bv, cv in rows:
             mark = "[green]^[/green]" if improved else "[red]v[/red]"
-            t.add_row(mark, i, label, f"{_pq_fmt(key, bv)} -> {_pq_fmt(key, cv)}")
+            t.add_row(mark, escape(str(i)), label, f"{_pq_fmt(key, bv)} -> {_pq_fmt(key, cv)}")
         console.print(t)
     else:
         console.print("[dim]No per-question changes between these two runs.[/dim]")
 
     if only_base or only_cand:
         console.print(
-            f"[yellow]Note: question sets differ - only-in-base: {only_base or '(none)'}, "
-            f"only-in-candidate: {only_cand or '(none)'}[/yellow]"
+            "[yellow]Note: question sets differ[/yellow] - "
+            f"only-in-base: {escape(str(only_base or '(none)'))}, "
+            f"only-in-candidate: {escape(str(only_cand or '(none)'))}"
         )
 
 
@@ -159,6 +216,11 @@ def main() -> None:
     parser.add_argument("files", nargs="*", help="result JSON files (baseline first)")
     parser.add_argument("--latest", type=int, default=None, help="auto-pick the N newest result files")
     parser.add_argument("--out", default=str(APP_ROOT / "eval" / "results"))
+    parser.add_argument(
+        "--allow-incompatible",
+        action="store_true",
+        help="Compare despite blocking provenance differences (results may be misleading).",
+    )
     args = parser.parse_args()
 
     if args.latest:
@@ -169,15 +231,26 @@ def main() -> None:
         raise SystemExit("Pass at least 2 result files, or use --latest N.")
 
     runs = [load_run(p) for p in paths]
+    for candidate in runs[1:]:
+        blocking, advisory = compatibility_issues(runs[0], candidate)
+        for issue in advisory:
+            console.print(f"[yellow]Comparability note:[/yellow] {escape(issue)}")
+        if blocking:
+            for issue in blocking:
+                console.print(f"[red]Incompatible scorecards:[/red] {escape(issue)}")
+            if not args.allow_incompatible:
+                raise SystemExit(
+                    "Comparison stopped. Re-run with --allow-incompatible to inspect it anyway."
+                )
     console.print(f"[bold]Comparing {len(runs)} runs[/bold] (baseline first):")
     for r in runs:
-        console.print(f"  - {r['_label']}  ([dim]{r['_file']}[/dim])")
+        console.print(f"  - {r['_label']}  ([dim]{escape(r['_file'])}[/dim])")
 
     # Retrieval is only comparable when the embedder is held constant.
     embedders = {r.get("embed_model") for r in runs}
     if len(embedders) > 1:
         console.print(
-            f"[yellow]Warning: different embedders across runs ({embedders}) - "
+            f"[yellow]Warning: different embedders across runs ({escape(str(embedders))}) - "
             f"retrieval metrics are NOT comparable; trust keyword/refusal/latency only.[/yellow]"
         )
     console.print()

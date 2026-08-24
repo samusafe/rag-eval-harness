@@ -16,6 +16,7 @@ FIXED_GIT = {"commit_sha": "0123456789abcdef0123456789abcdef01234567", "dirty": 
 def _manifest(**kwargs):
     kwargs.setdefault("timestamp", FIXED_TIME)
     kwargs.setdefault("git_metadata", FIXED_GIT)
+    kwargs.setdefault("runtime_metadata", {"test": True})
     return build_run_manifest(kwargs.pop("eval_set_path", None), kwargs.pop("model", "m"), **kwargs)
 
 
@@ -25,7 +26,7 @@ def test_manifest_is_deterministic_for_fixed_inputs():
 
 def test_manifest_records_provenance_fields():
     manifest = _manifest(model="my-finetuned-model-v2")
-    assert manifest["schema_version"] == 1
+    assert manifest["schema_version"] == 2
     assert manifest["timestamp_utc"] == "2026-01-02T03:04:05Z"
     assert manifest["git"] == FIXED_GIT
     assert manifest["chat_model"] == "my-finetuned-model-v2"
@@ -34,8 +35,13 @@ def test_manifest_records_provenance_fields():
     assert manifest["retrieval"] == {
         "top_k": eval_service.settings.RETRIEVAL_TOP_K,
         "rerank_top_n": eval_service.settings.RERANK_TOP_N,
+        "distance_strategy": eval_service.settings.PGVECTOR_DISTANCE_STRATEGY,
+        "collection_name": "rag_documents",
+        "collection_id_filter": None,
+        "corpus_revision": eval_service.settings.CORPUS_REVISION,
     }
     assert manifest["python_version"] == platform.python_version()
+    assert manifest["runtime"] == {"test": True}
 
 
 def test_manifest_hashes_the_prompt_actually_used():

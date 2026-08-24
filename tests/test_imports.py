@@ -12,6 +12,7 @@ MODULES = [
     "services.vector_store",
     "services.rag_chain",
     "services.eval_service",
+    "services.ollama_info",
     "eval.run_eval",
     "eval.compare_runs",
     "eval.bench_ollama",

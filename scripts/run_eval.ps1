@@ -18,7 +18,9 @@
 [CmdletBinding()]
 param(
     [string[]]$Models = @(),
-    [switch]$Mlflow
+    [switch]$Mlflow,
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$Arguments = @()
 )
 
 $ErrorActionPreference = "Stop"
@@ -29,6 +31,7 @@ function Invoke-Eval {
     $runArgs = @("eval/run_eval.py")
     if ($Model) { $runArgs += @("--model", $Model) }
     if ($Mlflow) { $runArgs += "--mlflow" }
+    $runArgs += $Arguments
     Write-Host "==> python $($runArgs -join ' ')" -ForegroundColor Cyan
     & python @runArgs
     if ($LASTEXITCODE -ne 0) { throw "run_eval.py failed (exit $LASTEXITCODE)" }

@@ -4,7 +4,7 @@
 //    "expected_keywords":[strings the answer should contain], "must_refuse": bool}
 // Lines starting with // are comments and are ignored by the loader.
 //
-// This file ships ready to run against a demo/fake ingestion of a handbook
+// This file is a schema example for an ingestion of a fictional handbook
 // with these documents: employee-handbook.pdf, security-policy.pdf,
 // expense-policy.pdf, benefits-guide.pdf. Swap in your own docs/questions —
 // keep the schema, change expected_sources/expected_keywords to match.

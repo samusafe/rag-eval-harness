@@ -17,6 +17,7 @@ import logging
 
 from langchain_ollama import OllamaEmbeddings
 from langchain_postgres import PGVector
+from langchain_postgres.vectorstores import DistanceStrategy
 
 from config import settings
 
@@ -60,6 +61,8 @@ def get_vector_store() -> PGVector:
             embeddings=get_embeddings(),
             collection_name=COLLECTION_NAME,
             connection=settings.database_url,
+            distance_strategy=DistanceStrategy.COSINE,
+            engine_args={"pool_size": 1, "max_overflow": 1, "pool_pre_ping": True},
             use_jsonb=True,
         )
         logger.info("PGVector store ready (collection=%s)", COLLECTION_NAME)

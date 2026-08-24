@@ -138,9 +138,24 @@ def test_strict_rejects_duplicate_ids(tmp_path):
     assert "line 2" in str(excinfo.value)
 
 
-def test_strict_accepts_the_reserved_expected_source_ids_field(tmp_path):
+def test_strict_accepts_expected_source_ids_field(tmp_path):
     path = _write_set(tmp_path, _row(expected_source_ids=["doc-1#chunk-3"]))
     assert load_eval_set(path)[0].expected_source_ids == ["doc-1#chunk-3"]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"expected_keywords": [""]},
+        {"expected_sources": ["handbook", "HANDBOOK"]},
+        {"must_refuse": True, "expected_sources": ["handbook"]},
+        {"expected_sources": [], "expected_keywords": []},
+    ],
+)
+def test_strict_rejects_incoherent_expectations(tmp_path, overrides):
+    path = _write_set(tmp_path, _row(**overrides))
+    with pytest.raises(EvalSetValidationError):
+        load_eval_set(path)
 
 
 # --------------------------------------------------------------------------

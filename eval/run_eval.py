@@ -45,8 +45,8 @@ from pathlib import Path
 APP_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(APP_ROOT))
 
-from langchain_core.output_parsers import StrOutputParser  # noqa: E402
 from rich.console import Console  # noqa: E402
+from rich.markup import escape  # noqa: E402
 from rich.progress import (  # noqa: E402
     BarColumn,
     MofNCompleteColumn,
@@ -57,16 +57,19 @@ from rich.progress import (  # noqa: E402
     TimeRemainingColumn,
 )
 from rich.table import Table  # noqa: E402
+from rich.text import Text  # noqa: E402
 
 from config import settings  # noqa: E402
 from services.eval_service import (  # noqa: E402
     _eval_one,
     aggregate,
+    collect_runtime_metadata,
     load_eval_set,
     log_mlflow,
     write_results,
 )
 from services.gates import check_gates  # noqa: E402
+from services.ollama_info import fetch_ollama_metadata  # noqa: E402
 from services.rag_chain import get_rag_chain  # noqa: E402
 
 console = Console()
@@ -75,15 +78,19 @@ console = Console()
 def _print_row(r: dict) -> None:
     def mark(v):
         if v is None:
-            return "[dim]-[/dim]"
+            return "-"
         if isinstance(v, bool):
-            return "[green]OK[/green]" if v else "[red]X[/red]"
+            return "OK" if v else "X"
         return f"{v:.2f}"
 
     console.print(
-        f"  [bold]{r['id']}[/bold]  "
-        f"retr={mark(r['retrieval_hit'])} kw={mark(r['keyword_recall'])} "
-        f"refuse={mark(r['refusal_ok'])} {r['latency_s']}s"
+        Text.assemble(
+            "  ",
+            (str(r["id"]), "bold"),
+            f"  retr={mark(r['retrieval_hit'])} kw={mark(r['keyword_recall'])} ",
+            f"refuse={mark(r['refusal_ok'])} {r['latency_s']:.2f}s",
+        ),
+        markup=False,
     )
 
 
@@ -95,8 +102,15 @@ def _print_summary(agg: dict) -> None:
     table.add_row("Retrieval hit-rate", _fmt(agg["retrieval_hit_rate"]), ">= 0.80")
     table.add_row("Answer keyword recall", _fmt(agg["answer_keyword_recall"]), ">= 0.70")
     table.add_row("Refusal accuracy", _fmt(agg["refusal_accuracy"]), ">= 0.90")
+    table.add_row("Exact retrieval hit-rate", _fmt(agg["exact_retrieval_hit_rate"]), "-")
+    table.add_row("Mean reciprocal rank", _fmt(agg["mean_reciprocal_rank"]), "-")
+    table.add_row("Answerability accuracy", _fmt(agg["answerability_accuracy"]), "-")
+    table.add_row("Citation coverage", _fmt(agg["citation_coverage"]), "-")
+    table.add_row("Citation validity", _fmt(agg["citation_validity"]), "-")
     table.add_row(
-        "Median latency", f"{agg['median_latency_s']}s" if agg["median_latency_s"] else "-", "-"
+        "Median latency",
+        f"{agg['median_latency_s']}s" if agg["median_latency_s"] is not None else "-",
+        "-",
     )
     table.add_row("Questions", str(agg["n"]), "-")
     console.print()
@@ -105,6 +119,20 @@ def _print_summary(agg: dict) -> None:
 
 def _fmt(v) -> str:
     return "-" if v is None else f"{v:.0%}" if v <= 1 else str(v)
+
+
+def _probability(value: str) -> float:
+    parsed = float(value)
+    if not 0 <= parsed <= 1:
+        raise argparse.ArgumentTypeError("must be between 0 and 1")
+    return parsed
+
+
+def _non_negative(value: str) -> float:
+    parsed = float(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return parsed
 
 
 def main() -> None:
@@ -120,6 +148,11 @@ def main() -> None:
     )
     parser.add_argument("--mlflow", action="store_true", help="Also log this run to MLflow")
     parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="Validate Ollama, pgvector, embedding, and reranker with one retrieval, then exit.",
+    )
+    parser.add_argument(
         "--permissive-eval-set",
         action="store_true",
         help="Skip invalid rows for investigation only (strict validation is the default).",
@@ -127,37 +160,67 @@ def main() -> None:
     # CI / promotion gates: exit 2 when the scorecard misses a threshold, so a
     # pipeline (GitHub Actions, or qlora-8gb-pipeline's post-export check) can
     # block a regressed model without parsing output.
-    parser.add_argument("--gate-hit-rate", type=float, default=None, metavar="0.8",
+    parser.add_argument("--gate-hit-rate", type=_probability, default=None, metavar="0.8",
                         help="Fail unless retrieval_hit_rate >= this")
-    parser.add_argument("--gate-recall", type=float, default=None, metavar="0.6",
+    parser.add_argument("--gate-recall", type=_probability, default=None, metavar="0.6",
                         help="Fail unless answer_keyword_recall >= this")
-    parser.add_argument("--gate-refusal", type=float, default=None, metavar="0.9",
+    parser.add_argument("--gate-refusal", type=_probability, default=None, metavar="0.9",
                         help="Fail unless refusal_accuracy >= this")
-    parser.add_argument("--gate-max-latency", type=float, default=None, metavar="8.0",
+    parser.add_argument("--gate-max-latency", type=_non_negative, default=None, metavar="8.0",
                         help="Fail if median_latency_s exceeds this (seconds)")
+    parser.add_argument("--gate-exact-hit-rate", type=_probability, default=None)
+    parser.add_argument("--gate-mrr", type=_probability, default=None)
+    parser.add_argument("--gate-answerability", type=_probability, default=None)
+    parser.add_argument("--gate-citation-coverage", type=_probability, default=None)
+    parser.add_argument("--gate-citation-validity", type=_probability, default=None)
     args = parser.parse_args()
 
-    # --model overrides the configured chat model for THIS process only. Every
-    # downstream read (chain build, scorecard filename, MLflow run name) goes
-    # through settings.OLLAMA_CHAT_MODEL, so setting it here is enough.
-    if args.model:
-        settings.OLLAMA_CHAT_MODEL = args.model
-
+    selected_model = args.model or settings.OLLAMA_CHAT_MODEL
     eval_set_path = Path(args.set)
     rows = load_eval_set(eval_set_path, strict=not args.permissive_eval_set)
+    if settings.CORPUS_REVISION == "unversioned":
+        console.print(
+            "[yellow]Warning: CORPUS_REVISION is unversioned; this run cannot prove "
+            "that the underlying corpus matches another run.[/yellow]"
+        )
+
+    runtime_metadata = collect_runtime_metadata()
+    with console.status("[cyan]Checking Ollama model metadata...[/cyan]"):
+        runtime_metadata["ollama_chat_model"] = fetch_ollama_metadata(
+            settings.OLLAMA_BASE_URL, selected_model, settings.OLLAMA_REQUEST_TIMEOUT
+        )
+        runtime_metadata["ollama_embedding_model"] = fetch_ollama_metadata(
+            settings.OLLAMA_BASE_URL,
+            settings.OLLAMA_EMBED_MODEL,
+            settings.OLLAMA_REQUEST_TIMEOUT,
+        )
+
     console.print(
-        f"[bold]Loaded {len(rows)} eval questions[/bold] - "
-        f"model=[cyan]{settings.OLLAMA_CHAT_MODEL}[/cyan] - "
-        f"embed=[cyan]{settings.OLLAMA_EMBED_MODEL}[/cyan]\n"
+        Text.assemble(
+            (f"Loaded {len(rows)} eval questions - model=", "bold"),
+            (selected_model, "cyan"),
+            " - embed=",
+            (settings.OLLAMA_EMBED_MODEL, "cyan"),
+        )
     )
 
     # Reuse the REAL pipeline components. Building them is itself slow the first
     # time (vector-store handshake + cross-encoder load/download), so it gets its
     # own spinner — otherwise the run looks hung before question 1 even starts.
     with console.status("[cyan]Connecting to vector store and loading reranker...[/cyan]"):
-        prompt, llm, get_retriever = get_rag_chain()
+        prompt, llm, get_retriever = get_rag_chain(selected_model)
         retriever = get_retriever(args.collection)
-        chain = prompt | llm | StrOutputParser()
+        # Keep AIMessage metadata (token counts and Ollama phase timings).
+        chain = prompt | llm
+
+    if args.preflight_only:
+        with console.status("[cyan]Running one retrieval preflight...[/cyan]"):
+            docs = retriever.invoke(rows[0].question)
+        console.print(
+            f"[green]Preflight passed:[/green] Ollama models available and retrieval returned "
+            f"{len(docs)} reranked document(s)."
+        )
+        return
 
     # A local LLM answers in tens of seconds, so a bare loop looks frozen for
     # minutes on end. Live progress (which question is running, how many are
@@ -178,7 +241,7 @@ def main() -> None:
         with progress:
             task = progress.add_task("Evaluating", total=len(rows))
             for row in rows:
-                progress.update(task, description=f"[cyan]{row.id}[/cyan]")
+                progress.update(task, description=f"[cyan]{escape(str(row.id))}[/cyan]")
                 r = _eval_one(row, retriever, chain)
                 results.append(r)
                 _print_row(r)
@@ -193,18 +256,26 @@ def main() -> None:
         ) from None
 
     agg = aggregate(results)
+    try:
+        runtime_metadata["ollama_chat_model"] = fetch_ollama_metadata(
+            settings.OLLAMA_BASE_URL, selected_model, settings.OLLAMA_REQUEST_TIMEOUT
+        )
+    except RuntimeError as error:
+        console.print(f"[yellow]Could not refresh post-run Ollama VRAM metadata: {escape(str(error))}[/yellow]")
     _print_summary(agg)
     out_path = write_results(
         results,
         agg,
         Path(args.out),
-        settings.OLLAMA_CHAT_MODEL,
+        selected_model,
         eval_set_path=eval_set_path,
+        collection_id=args.collection,
+        runtime_metadata=runtime_metadata,
     )
     console.print(f"\nSaved -> [cyan]{out_path}[/cyan]  (diff against a prior run to see if a change helped)")
 
     if args.mlflow:
-        log_mlflow(agg, settings.OLLAMA_CHAT_MODEL, out_path)
+        log_mlflow(agg, selected_model, out_path)
 
     # Gates run LAST: the scorecard is already written and logged, so a failed
     # gate still leaves a full result file to diff against.
@@ -214,6 +285,11 @@ def main() -> None:
             ("retrieval_hit_rate", args.gate_hit_rate),
             ("answer_keyword_recall", args.gate_recall),
             ("refusal_accuracy", args.gate_refusal),
+            ("exact_retrieval_hit_rate", args.gate_exact_hit_rate),
+            ("mean_reciprocal_rank", args.gate_mrr),
+            ("answerability_accuracy", args.gate_answerability),
+            ("citation_coverage", args.gate_citation_coverage),
+            ("citation_validity", args.gate_citation_validity),
         )
         if threshold is not None
     }

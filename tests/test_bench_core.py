@@ -25,6 +25,8 @@ def test_summarize_runs_empty_samples():
     assert summary["gen_tps_median"] is None
     assert summary["prompt_tps_median"] is None
     assert summary["load_ms_median"] is None
+    assert summary["total_ms_median"] is None
+    assert summary["total_ms_p95"] is None
 
 
 def test_summarize_runs_computes_medians():
@@ -35,6 +37,7 @@ def test_summarize_runs_computes_medians():
             "prompt_eval_count": 50,
             "prompt_eval_duration": 500_000_000,
             "load_duration": 200_000_000,
+            "total_duration": 2_000_000_000,
         },
         {
             "eval_count": 120,
@@ -42,6 +45,7 @@ def test_summarize_runs_computes_medians():
             "prompt_eval_count": 60,
             "prompt_eval_duration": 500_000_000,
             "load_duration": 300_000_000,
+            "total_duration": 3_000_000_000,
         },
     ]
     summary = summarize_runs(samples)
@@ -49,6 +53,8 @@ def test_summarize_runs_computes_medians():
     assert summary["gen_tps_median"] == 110.0
     assert summary["prompt_tps_median"] == 110.0
     assert summary["load_ms_median"] == 250.0
+    assert summary["total_ms_median"] == 2500.0
+    assert summary["total_ms_p95"] == 2950.0
 
 
 def test_summarize_runs_skips_incomplete_samples():

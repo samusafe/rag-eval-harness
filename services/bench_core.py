@@ -33,6 +33,7 @@ def summarize_runs(samples: list[dict]) -> dict:
     gen: list[float] = []
     prompt: list[float] = []
     load_ms: list[float] = []
+    total_ms: list[float] = []
     for s in samples:
         g = tps(s.get("eval_count"), s.get("eval_duration"))
         if g is not None:
@@ -43,9 +44,24 @@ def summarize_runs(samples: list[dict]) -> dict:
         ld = s.get("load_duration")
         if ld:
             load_ms.append(round(ld / NS_PER_MS, 1))
+        total = s.get("total_duration")
+        if total:
+            total_ms.append(total / NS_PER_MS)
+
+    def percentile(values: list[float], quantile: float) -> float | None:
+        if not values:
+            return None
+        ordered = sorted(values)
+        position = (len(ordered) - 1) * quantile
+        lower = int(position)
+        upper = min(lower + 1, len(ordered) - 1)
+        return round(ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower), 1)
+
     return {
         "runs": len(samples),
         "gen_tps_median": statistics.median(gen) if gen else None,
         "prompt_tps_median": statistics.median(prompt) if prompt else None,
         "load_ms_median": statistics.median(load_ms) if load_ms else None,
+        "total_ms_median": statistics.median(total_ms) if total_ms else None,
+        "total_ms_p95": percentile(total_ms, 0.95),
     }

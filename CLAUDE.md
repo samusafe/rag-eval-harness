@@ -47,6 +47,7 @@ pip install -r requirements-dev.txt      # + pytest, ruff
 python eval/run_eval.py
 python eval/run_eval.py --model my-finetuned-model-v2 --mlflow
 python eval/run_eval.py --permissive-eval-set   # investigate a broken eval set
+python eval/run_eval.py --preflight-only         # validate the live stack cheaply
 
 # Compare two (or more) prior runs
 python eval/compare_runs.py --latest 2
@@ -54,12 +55,13 @@ python eval/compare_runs.py --latest 2
 # Benchmark raw Ollama throughput (tokens/sec)
 python eval/bench_ollama.py --model my-finetuned-model --runs 5 --mlflow
 
-# Tests (no live services required — schema/config/import only)
+# Tests (installed dependencies required; no live services required)
 python -m pytest
 
 # Lint + types
 ruff check .
 python -m mypy
+pip-audit -r requirements.txt
 ```
 
 Equivalent wrapper scripts ship for both shells: `scripts/run_eval.ps1` /
@@ -75,12 +77,17 @@ interpreter). All config is environment-driven with localhost defaults — see
 `.env.example` and `config.py` (the single source of truth; nothing reads
 `os.getenv` outside that file).
 
+For an 8 GB RTX 4060, the conservative default is `RERANK_DEVICE=cpu`; CUDA
+reranking is opt-in and must be measured with `docs/GPU_VALIDATION.md`.
+Set `CORPUS_REVISION` to an immutable value before treating comparisons as
+citable evidence.
+
 ## Tests
 
 `tests/` only covers what's true without Ollama/Postgres/MLflow running:
-eval-set schema validation (including every strict-mode rejection path),
-refusal-contract scoring, run-manifest construction, config defaults/overrides,
-clean module imports, and the pure scoring/aggregation/bench-math functions. It does NOT fake a
+eval-set schema validation (including every strict-mode rejection path), exact
+retrieval/citation/answerability scoring, manifest and comparison compatibility,
+config defaults/overrides, clean imports, and pure bench math. It does NOT fake a
 passing end-to-end pipeline — there is no mock LLM pretending eval scores
 are real. Running the harness against a live model is a manual/CI-external
 step, by design (see README).

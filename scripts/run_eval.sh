@@ -10,19 +10,12 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-mlflow_flag=()
-for arg in "$@"; do
-  if [ "$arg" = "--mlflow" ]; then
-    mlflow_flag=(--mlflow)
-  fi
-done
-
 if [ -z "${MODELS:-}" ]; then
-  echo "==> python eval/run_eval.py ${mlflow_flag[*]:-}"
-  python eval/run_eval.py "${mlflow_flag[@]}"
+  echo "==> python eval/run_eval.py $*"
+  python eval/run_eval.py "$@"
 else
   for model in $MODELS; do
-    echo "==> python eval/run_eval.py --model $model ${mlflow_flag[*]:-}"
-    python eval/run_eval.py --model "$model" "${mlflow_flag[@]}"
+    echo "==> python eval/run_eval.py --model $model $*"
+    python eval/run_eval.py --model "$model" "$@"
   done
 fi

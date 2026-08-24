@@ -12,7 +12,16 @@ from __future__ import annotations
 from typing import Any
 
 # Keys must match aggregate() in services/eval_service.py.
-MIN_GATES = ("retrieval_hit_rate", "answer_keyword_recall", "refusal_accuracy")
+MIN_GATES = (
+    "retrieval_hit_rate",
+    "exact_retrieval_hit_rate",
+    "mean_reciprocal_rank",
+    "answer_keyword_recall",
+    "refusal_accuracy",
+    "answerability_accuracy",
+    "citation_coverage",
+    "citation_validity",
+)
 MAX_GATES = ("median_latency_s",)
 
 

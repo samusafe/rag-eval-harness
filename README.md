@@ -36,7 +36,7 @@ RAG has a lot of knobs that all sound plausible in isolation: swap the generator
 | Scores the real chain | No mock LLM, no fixture answers — questions go through the same pgvector search, cross-encoder reranker, prompt and local Ollama model your app uses. |
 | Anti-hallucination signal | `must_refuse` rows check that out-of-KB questions produce the exact refusal sentence and nothing else, so an answer-plus-refusal cannot pass. |
 | Fail-closed eval set | Rows are strictly typed and validated; a malformed row aborts the run instead of silently shrinking the question set. |
-| Reproducible scorecards | Every result JSON carries a `run_manifest`: git SHA and dirty flag, eval-set hash, model names, retrieval knobs, prompt and config hashes. |
+| Provenance-aware scorecards | Manifest v2 records code/data hashes, corpus revision, model metadata, retrieval/generation knobs, packages and hardware. Unsafe comparisons stop by default. |
 | Run-to-run diffing | `compare_runs.py` prints a summary delta and a per-question breakdown, regressions first, and warns when two runs used different embedders. |
 | Live progress | A spinner over the slow startup, then a progress bar with the running question, elapsed time and ETA — a silent run is indistinguishable from a hung one. |
 | Experiment tracking | Optional MLflow logging puts models, adapters and prompt versions side by side across many runs, not just the two most recent. |
@@ -81,7 +81,8 @@ Everything is local: Ollama for both the chat model and the embeddings. No cloud
 - Python 3.11+
 - A reachable [Ollama](https://ollama.com) with a chat model and an embedding model pulled
 - PostgreSQL with the `pgvector` extension and a populated `rag_documents` collection
-- MLflow, only if you want `--mlflow` tracking
+- an MLflow tracking server, only if you want `--mlflow` tracking (the lightweight
+  client is already installed)
 
 ### 1. Install
 
@@ -121,6 +122,7 @@ Every value already has a localhost default in `config.py` — `.env` is only ne
 python eval/run_eval.py
 python eval/run_eval.py --model my-finetuned-model-v2 --mlflow   # A/B a different model
 python eval/run_eval.py --collection <collection_id>             # scope to one collection
+python eval/run_eval.py --preflight-only                         # validate the live stack cheaply
 ```
 
 Gate a run in CI or a promotion pipeline — exit code `2` when any threshold is
@@ -141,12 +143,16 @@ python eval/compare_runs.py --latest 2
 python eval/compare_runs.py eval/results/<baseline>.json eval/results/<candidate>.json
 ```
 
+Comparison stops when quality-defining provenance differs. Use
+`--allow-incompatible` only to inspect mismatched files while accepting that their
+deltas are not causal.
+
 For exactly two runs it also prints a per-question breakdown, **regressions first** — that is where the debugging value is. If the two runs used different embedders it warns that retrieval hit-rate is not comparable between them.
 
 ### 5. (optional) Benchmark raw Ollama throughput
 
 ```bash
-python eval/bench_ollama.py --model my-finetuned-model --runs 5 --mlflow
+python eval/bench_ollama.py --model my-finetuned-model --runs 5 --warmups 1 --out eval/results/bench.json
 ```
 
 Shell wrappers ship for both platforms: `scripts/run_eval.ps1` / `scripts/run_eval.sh` and `scripts/compare.ps1` / `scripts/compare.sh`.
@@ -156,7 +162,10 @@ Shell wrappers ship for both platforms: `scripts/run_eval.ps1` / `scripts/run_ev
 
 ### What this repo does NOT include
 
-This is the **evaluation harness**, not a full RAG service. There is no ingestion pipeline here (chunking, OCR, upload API) — you bring your own populated `pgvector` collection, or point `services/vector_store.py` at whatever vector store your stack already uses. The shipped eval set contains synthetic questions about a fictional company handbook so the schema is obvious; swap in your own once you have ingested real documents.
+This is the **evaluation harness**, not a full RAG service. There is no ingestion pipeline here (chunking, OCR, upload API) — you bring your own populated `pgvector` collection, or point `services/vector_store.py` at whatever vector store your stack already uses. The shipped eval set demonstrates the schema but is **not a meaningful runnable eval** until matching fictional handbook documents are ingested; normally, replace it with your own corpus and questions.
+
+`--collection` is a `collection_id` metadata filter inside the fixed PGVector
+collection `rag_documents`; it does not select a different PGVector collection.
 
 ## Eval set
 
@@ -169,7 +178,7 @@ One JSON object per line, in `eval/eval_set.example.jsonl`. Lines starting with 
 | `expected_sources` | Substrings expected in a retrieved chunk's `source_file` metadata. Empty list = retrieval not scored |
 | `expected_keywords` | Strings the answer should contain. Empty list = recall not scored |
 | `must_refuse` | `true` for out-of-KB questions — the answer must be exactly the refusal sentence |
-| `expected_source_ids` | *Optional, reserved.* Exact chunk/document IDs for a future exact-match retrieval metric. Accepted and stored today, not scored yet |
+| `expected_source_ids` | Optional stable chunk/document IDs used for exact hit-rate and mean reciprocal rank |
 
 Include several `must_refuse: true` rows — those are what catch hallucination, the highest-risk RAG failure mode.
 
@@ -195,10 +204,13 @@ Computed in `services/eval_service.py`, printed by `eval/run_eval.py`. Each metr
 
 | Metric | Target | Meaning |
 | --- | ---: | --- |
-| Retrieval hit-rate | >= 0.80 | A retrieved chunk's `source_file` contains one of the row's `expected_sources`, after reranking. Bad retrieval caps everything downstream. |
+| Retrieval hit-rate | >= 0.80 | A retrieved chunk's `source_file` contains one of the row's `expected_sources`, after reranking. |
+| Exact hit-rate / MRR | dataset-specific | Exact `expected_source_ids` hit and reciprocal rank; requires stable ingestion IDs. |
 | Answer keyword recall | >= 0.70 | Fraction of `expected_keywords` present in the answer, case-insensitive. |
 | Refusal accuracy | >= 0.90 | For `must_refuse` rows, the whole answer is the configured refusal sentence. The anti-hallucination signal. |
-| Median latency | — | Wall-clock seconds per question (retrieval + rerank + generation). Your speed baseline. |
+| Answerability accuracy | dataset-specific | Penalizes exact refusal on answerable rows. |
+| Citation coverage / validity | dataset-specific | Whether answers cite and whether cited headers were supplied. |
+| Median / p95 latency | — | End-to-end wall time; retrieval and generation medians are also persisted. |
 
 No baseline scorecard is published here on purpose: the numbers depend entirely on your corpus, embedder and generator, so a figure from this repo's synthetic set would be meaningless for yours.
 
@@ -207,7 +219,7 @@ No baseline scorecard is published here on purpose: the numbers depend entirely 
 Being explicit about this matters more than the numbers themselves.
 
 - **Keyword recall is lexical, not factual.** It checks that strings appear, not that the answer is true. *"The policy is **not** 20 days"* scores a full 1.0 against `["20 days"]`. Read it as "did the answer keep talking about the right things", never as a correctness score.
-- **Retrieval hit-rate is substring matching over file names**, not exact chunk identity. It tolerates the path and extension noise real ingestion pipelines produce, at the cost of counting a coincidental name match as a hit. `expected_source_ids` is the reserved slot for the exact-match version.
+- **Retrieval hit-rate is substring matching over file names**, not exact chunk identity. It tolerates path and extension noise at the cost of possible coincidental matches. Prefer `expected_source_ids` when ingestion supplies stable IDs.
 - **Refusal accuracy is exact, after whitespace and case normalization only.** The entire answer must equal the refusal sentence; trailing newlines, doubled spaces and capitalization are forgiven, added words are not. A substring test would score *"The capital is Canberra. I don't have enough information in the knowledge base to answer this question."* as a correct refusal — grading a hallucination as anti-hallucination.
 - **There is no LLM-as-judge.** Every metric is deterministic, so re-running the same set against the same model moves the numbers only when the system changed, not when the judge felt different.
 
@@ -218,14 +230,28 @@ A score is only evidence if you can say what produced it. Every scorecard carrie
 ```json
 {
   "run_manifest": {
-    "schema_version": 1,
+    "schema_version": 2,
     "timestamp_utc": "2026-01-02T03:04:05Z",
     "git": { "commit_sha": "0123456789abcdef0123456789abcdef01234567", "dirty": false },
     "eval_set_sha256": "b9a2...",
     "chat_model": "my-finetuned-model-v2",
     "embedding_model": "nomic-embed-text",
     "reranker_model": "BAAI/bge-reranker-base",
-    "retrieval": { "top_k": 20, "rerank_top_n": 5 },
+    "retrieval": {
+      "top_k": 20,
+      "rerank_top_n": 5,
+      "distance_strategy": "cosine",
+      "collection_name": "rag_documents",
+      "collection_id_filter": null,
+      "corpus_revision": "handbook-2026-08"
+    },
+    "generation": { "temperature": 0.1, "num_ctx": 4096, "num_predict": 512 },
+    "reranker": { "device": "cpu", "revision": "<pinned-HF-commit>" },
+    "runtime": {
+      "packages": { "langchain-core": "1.6.0" },
+      "gpus": ["NVIDIA GeForce RTX 4060 Laptop GPU, 8192"],
+      "ollama_chat_model": { "digest": "a2af...", "quantization_level": "Q4_K_M" }
+    },
     "python_version": "3.11.9",
     "prompt_sha256": "7c31...",
     "config_sha256": "e0f4..."
@@ -238,13 +264,38 @@ A score is only evidence if you can say what produced it. Every scorecard carrie
 | `git.commit_sha` / `git.dirty` | Which code ran, and whether it was a clean checkout. **`dirty: true` means the scorecard is not reproducible.** |
 | `eval_set_sha256` | The exact question-set bytes. Two runs are only comparable when this matches. |
 | `prompt_sha256` / `config_sha256` | Catches the silent killers — an edited prompt or a changed `RETRIEVAL_TOP_K` that would otherwise look like the model got better. |
-| Model names, `retrieval`, `python_version`, `timestamp_utc` | The rest of the environment, in one place. |
+| Models, `retrieval`, `generation`, `reranker`, `runtime` | Corpus/filter, inference settings, resolved packages, model digest/quantization and hardware. |
+
+Set `CORPUS_REVISION` to an immutable ingestion release, dataset digest, or commit.
+The default `unversioned` emits a warning because unchanged configuration cannot prove
+that database contents stayed unchanged. Ollama tags are resolved at run time and their
+digest and quantization are persisted. Dependency ranges are not a lockfile.
+
+## RTX 4060 / 8 GB profile
+
+The conservative default keeps the 0.3B reranker on CPU (`RERANK_DEVICE=cpu`) so
+its Python process does not compete with Ollama for scarce VRAM. Evaluation remains
+sequential. An explicit output/prompt reserve bounds retrieved context, and each result
+records estimated supplied tokens plus truncated or dropped chunks.
+
+The reranker uses a small direct `sentence-transformers` adapter, avoiding an
+unnecessary wrapper; device, max sequence length, revision and batch size are explicit
+configuration and provenance.
+
+On the target GPU, benchmark CPU versus CUDA reranking and Ollama Flash Attention plus
+`OLLAMA_KV_CACHE_TYPE=q8_0`; do not assume they improve a particular model without
+running the same quality gates. Follow [GPU_VALIDATION.md](docs/GPU_VALIDATION.md).
 
 Git metadata is **best-effort and never fatal**: running from a tarball, a container, or a machine without git yields explicit `null`s — `dirty: null` means *unknown*, not *clean* — rather than an error or a fabricated value. The whole block is additive, so older result files still diff against newer ones.
 
 ## MLflow
 
 `--mlflow` on `run_eval.py` and `bench_ollama.py` logs params, metrics and the scorecard JSON (manifest included) as an artifact to a local MLflow tracking server — `MLFLOW_TRACKING_URI`, default `http://localhost:5000`, under the `MLFLOW_EXPERIMENT_NAME` / `MLFLOW_BENCH_EXPERIMENT_NAME` experiments. Tracking failures are logged and never break the eval itself.
+
+Scorecards contain questions, answers and source names. Set
+`RESULT_CONTENT_MODE=redacted` to store SHA-256 hashes instead of question/answer text.
+Use authenticated HTTPS for a remote MLflow server; localhost HTTP is not a safe remote
+deployment configuration.
 
 ## Pointing the harness at another RAG (HTTP target)
 
@@ -307,7 +358,7 @@ Three caveats before trusting the output:
 | --- | --- | --- |
 | Eval, compare and bench flows | Implemented, offline-tested | Record a baseline scorecard against your own corpus and model. |
 | Eval-set validation | Fail-closed and typed, every rejection path covered by tests | Migrate your own eval set — unknown keys are rejected by design. |
-| Reproducibility | `run_manifest` per run, pinned dependency ranges, near-greedy decoding | Pin Ollama model tags by digest; tags are mutable, so a "same model" rerun is not guaranteed identical. |
+| Reproducibility | Manifest v2 and provenance-aware comparisons | Set immutable corpus/reranker revisions and adopt a reviewed lockfile before claiming bit-for-bit reproduction. |
 | Metrics | Deterministic lexical and refusal metrics, no LLM-as-judge | Add exact-ID retrieval scoring via `expected_source_ids` if file-name matching is too loose for you. |
 | CI and static checks | Ruff, mypy and pytest on every push and pull request | Add release automation and protected-branch rules. |
 | Tests | Offline only, by design — no live services faked | Live-model runs stay a manual step against your own stack. |
@@ -319,11 +370,15 @@ pip install -r requirements-dev.txt
 ruff check .        # lint  (ruff.toml)
 python -m mypy      # types (mypy.ini)
 python -m pytest
+pip-audit -r requirements.txt
 ```
 
 Type checking is deliberately pragmatic, not strict: mypy's default only checks annotated functions, which covers the typed core (eval-set loading, metrics, run manifest) without demanding a codebase-wide annotation pass. The one blanket exemption is `ignore_missing_imports` — the LangChain / Ollama / pgvector / MLflow stack ships no usable type information and has no stub packages.
 
-CI (`.github/workflows/ci.yml`) runs all three on a plain `ubuntu-latest` runner with **no Ollama, Postgres or MLflow present**. The suite is scoped to exactly what that allows: eval-set validation and its rejection paths, refusal-contract scoring, run-manifest construction, config defaults, clean imports, and the pure scoring and bench math. It does **not** fake a passing end-to-end pipeline — there is no mock LLM pretending eval scores are real.
+CI (`.github/workflows/ci.yml`) runs lint, types, tests and a dependency audit on a
+plain `ubuntu-latest` runner with **no live Ollama, Postgres or MLflow service**.
+Python dependencies are still installed. It does **not** fake a passing end-to-end
+pipeline or invent RAG scores.
 
 ## Design rules
 
