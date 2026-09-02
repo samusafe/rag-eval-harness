@@ -9,16 +9,23 @@ or inferred from a CPU-only development machine.
 2. Pull the exact chat and embedding models and set an immutable `CORPUS_REVISION`.
 3. Populate `rag_documents` and confirm stable source/chunk IDs are present.
 4. Save `nvidia-smi`, `ollama --version`, `ollama list`, and `pip freeze` output with the run.
+5. Pin `RERANK_MODEL_REVISION` to a Hugging Face commit SHA. Left blank the harness
+   still runs, but `run_eval.py` prints a warning — an unpinned reranker resolves to
+   whatever the Hub's default branch points at, so two runs may silently use different
+   weights.
 
 ## Baseline
 
 ```powershell
 python eval/run_eval.py --preflight-only
-python eval/run_eval.py --out eval/results/baseline --gate-hit-rate 0.8 --gate-recall 0.7 --gate-refusal 0.9
+python eval/run_eval.py --out eval/results/baseline --gate-hit-rate 0.8 --gate-recall 0.7 --gate-refusal 0.9 --gate-max-p95-latency 12
 python eval/bench_ollama.py --model <exact-model-tag> --runs 5 --warmups 1 --out eval/results/bench-baseline.json
 ollama ps
 nvidia-smi
 ```
+
+`--gate-max-p95-latency 12` above is an example threshold (seconds) — set it from
+your own measured baseline, not copied verbatim.
 
 Confirm that the scorecard manifest contains the Ollama digest/quantization, actual
 GPU identity, corpus revision, package versions, context settings, and reranker device.

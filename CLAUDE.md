@@ -19,8 +19,14 @@ duplication). This is a small, focused repo — resist adding layers.
 
 1. **1 file = 1 responsibility.** `services/vector_store.py` only connects to
    the vector DB; `services/rag_chain.py` only builds the chain;
-   `services/eval_service.py` only scores/persists. Need "and" to describe a
-   file's job → split it.
+   `services/rag_prompt.py` only owns the prompt template, refusal sentence
+   and context formatting; `services/eval_set.py` only loads/validates the
+   JSONL contract; `services/eval_metrics.py` only computes the pure scorers
+   and the scorecard aggregate; `services/eval_manifest.py` only builds run
+   provenance (git/host/package probes); `services/eval_compat.py` only
+   decides whether two scorecards are comparable; `services/eval_service.py`
+   is orchestration only (`eval_one`, `write_results`, `log_mlflow`) that
+   composes the above. Need "and" to describe a file's job → split it.
 2. **No new abstraction until the 2nd real duplication.** Nothing built "for
    the future" — this harness has exactly the knobs it needs today.
 3. **Fail loud.** No `catch`/`except` that swallows an error without either
@@ -87,10 +93,17 @@ citable evidence.
 `tests/` only covers what's true without Ollama/Postgres/MLflow running:
 eval-set schema validation (including every strict-mode rejection path), exact
 retrieval/citation/answerability scoring, manifest and comparison compatibility,
-config defaults/overrides, clean imports, and pure bench math. It does NOT fake a
-passing end-to-end pipeline — there is no mock LLM pretending eval scores
-are real. Running the harness against a live model is a manual/CI-external
-step, by design (see README).
+config defaults/overrides, clean imports, and pure bench math. It also pins two
+pipeline invariants with mocked collaborators — the cross-encoder reranker is a
+process-wide singleton (never reloaded per retriever/question) and the eval path
+never wires in an LLM cache (`tests/test_pipeline_invariants.py`) — and the module
+layout itself: `services/rag_prompt.py`, `eval_set.py`, `eval_metrics.py`,
+`eval_manifest.py`, `eval_service.py`, `eval_compat.py`, `gates.py`,
+`eval/compare_runs.py` and `eval/bench_ollama.py` must import cleanly in a fresh
+interpreter with no `torch`/`sentence_transformers`/`transformers` pulled in
+(`tests/test_module_layout.py`). It does NOT fake a passing end-to-end pipeline —
+there is no mock LLM pretending eval scores are real. Running the harness against
+a live model is a manual/CI-external step, by design (see README).
 
 ## Git
 
