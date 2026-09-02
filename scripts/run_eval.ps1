@@ -5,7 +5,9 @@
 .DESCRIPTION
   Thin wrapper around eval/run_eval.py. Requires Postgres+pgvector and Ollama
   reachable per your .env (see .env.example). Run with the project's venv
-  activated (or `python` resolvable on PATH).
+  activated (or `python` resolvable on PATH). Exits with the Python exit code,
+  so a failed gate (exit 2) survives into a CI pipeline; with several -Models
+  the first non-zero exit stops the loop.
 
 .EXAMPLE
   ./scripts/run_eval.ps1
@@ -14,8 +16,12 @@
 .EXAMPLE
   ./scripts/run_eval.ps1 -Models my-finetuned-model,my-finetuned-model-v2 -Mlflow
       # eval two models in a row, logging both to MLflow
+
+.EXAMPLE
+  ./scripts/run_eval.ps1 --gate-refusal 0.9 --gate-max-p95-latency 12
+      # any extra arguments are forwarded to run_eval.py
 #>
-[CmdletBinding()]
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [string[]]$Models = @(),
     [switch]$Mlflow,
@@ -34,16 +40,24 @@ function Invoke-Eval {
     $runArgs += $Arguments
     Write-Host "==> python $($runArgs -join ' ')" -ForegroundColor Cyan
     & python @runArgs
-    if ($LASTEXITCODE -ne 0) { throw "run_eval.py failed (exit $LASTEXITCODE)" }
+    return $LASTEXITCODE
 }
 
+$exitCode = 0
 Push-Location $repoRoot
 try {
     if ($Models.Count -eq 0) {
-        Invoke-Eval -Model $null
+        $exitCode = Invoke-Eval -Model $null
     } else {
-        foreach ($m in $Models) { Invoke-Eval -Model $m }
+        foreach ($m in $Models) {
+            $exitCode = Invoke-Eval -Model $m
+            if ($exitCode -ne 0) { break }
+        }
     }
 } finally {
     Pop-Location
 }
+if ($exitCode -ne 0) {
+    Write-Host "run_eval.py failed (exit $exitCode)" -ForegroundColor Red
+}
+exit $exitCode
