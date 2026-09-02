@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from services.eval_service import EvalSetValidationError, load_eval_set
+from services.eval_set import EvalSetValidationError, load_eval_set
 
 EVAL_SET = Path(__file__).resolve().parent.parent / "eval" / "eval_set.example.jsonl"
 
@@ -37,7 +37,7 @@ def _row(**overrides) -> str:
 
 def test_eval_set_loads_expected_row_count():
     rows = load_eval_set(EVAL_SET)
-    assert 8 <= len(rows) <= 10
+    assert len(rows) == 10
 
 
 def test_eval_set_rows_match_schema():
@@ -58,7 +58,7 @@ def test_eval_set_rows_match_schema():
 def test_eval_set_has_refusal_rows_for_anti_hallucination_coverage():
     rows = load_eval_set(EVAL_SET)
     refusals = [row for row in rows if row.must_refuse]
-    assert len(refusals) >= 2, "need at least a few must_refuse rows to catch hallucination"
+    assert len(refusals) == 3, "need at least a few must_refuse rows to catch hallucination"
     # Refusal rows shouldn't also carry expected_sources/keywords — they're
     # out-of-KB by construction and nothing should be scored against them.
     for row in refusals:

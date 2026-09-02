@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -29,10 +28,12 @@ from pathlib import Path
 import httpx
 
 # Allow `python eval/bench_ollama.py` from the repo root to import services.*
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+APP_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(APP_ROOT))
+
 from config import settings  # noqa: E402
 from services.bench_core import summarize_runs, tps  # noqa: E402
-from services.eval_service import collect_runtime_metadata  # noqa: E402
+from services.eval_manifest import collect_runtime_metadata  # noqa: E402
 from services.ollama_info import fetch_ollama_metadata  # noqa: E402
 
 DEFAULT_PROMPT = (
@@ -86,7 +87,9 @@ def main() -> None:
     if not 0 <= args.temperature <= 2:
         parser.error("--temperature must be between 0 and 2")
 
-    model_metadata = fetch_ollama_metadata(args.base_url, args.model, args.timeout)
+    # Preflight only: fail before spending warm-up runs on a missing model. The
+    # metadata that is persisted is the post-run snapshot below (it carries VRAM).
+    fetch_ollama_metadata(args.base_url, args.model, args.timeout)
 
     samples: list[dict] = []
     with httpx.Client() as client:

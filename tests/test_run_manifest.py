@@ -26,7 +26,7 @@ def test_manifest_is_deterministic_for_fixed_inputs():
 
 def test_manifest_records_provenance_fields():
     manifest = _manifest(model="my-finetuned-model-v2")
-    assert manifest["schema_version"] == 2
+    assert manifest["schema_version"] == 3
     assert manifest["timestamp_utc"] == "2026-01-02T03:04:05Z"
     assert manifest["git"] == FIXED_GIT
     assert manifest["chat_model"] == "my-finetuned-model-v2"
@@ -36,7 +36,7 @@ def test_manifest_records_provenance_fields():
         "top_k": eval_service.settings.RETRIEVAL_TOP_K,
         "rerank_top_n": eval_service.settings.RERANK_TOP_N,
         "distance_strategy": eval_service.settings.PGVECTOR_DISTANCE_STRATEGY,
-        "collection_name": "rag_documents",
+        "collection_name": eval_service.settings.PGVECTOR_COLLECTION_NAME,
         "collection_id_filter": None,
         "corpus_revision": eval_service.settings.CORPUS_REVISION,
     }
@@ -88,7 +88,56 @@ def test_missing_git_metadata_is_explicit_null_not_a_guess():
 def test_git_lookup_never_raises_and_always_answers_both_keys():
     # Runs the real lookup: whatever the environment (no git, no repo, a hang),
     # it must degrade to None rather than break the eval run.
-    git = eval_service._git_metadata()
+    git = eval_service.git_metadata()
     assert set(git) == {"commit_sha", "dirty"}
     assert git["commit_sha"] is None or isinstance(git["commit_sha"], str)
     assert git["dirty"] is None or isinstance(git["dirty"], bool)
+
+
+
+def test_manifest_v3_records_comparability_inputs(tmp_path):
+    eval_set = tmp_path / "my_set.jsonl"
+    eval_set.write_bytes(b"{}\n")
+    manifest = _manifest(eval_set_path=eval_set, eval_set_strict=False, gates={"refusal_accuracy": 0.9})
+    assert manifest["schema_version"] == 3
+    assert manifest["eval_set_name"] == "my_set.jsonl"
+    assert manifest["eval_set_strict"] is False
+    assert manifest["gates"] == {"refusal_accuracy": 0.9}
+    assert manifest["result_content_mode"] in {"full", "redacted"}
+    assert manifest["retrieval"]["collection_name"] == eval_service.settings.PGVECTOR_COLLECTION_NAME
+
+
+def test_manifest_defaults_new_fields_when_caller_does_not_know_them():
+    manifest = _manifest()
+    assert manifest["eval_set_name"] is None
+    assert manifest["eval_set_strict"] is None
+    assert manifest["gates"] == {}
+
+
+def test_git_metadata_reports_dirty_from_porcelain(monkeypatch):
+    import subprocess
+
+    from services import eval_manifest
+
+    monkeypatch.setattr(eval_manifest.shutil, "which", lambda name: "/usr/bin/git")
+
+    def fake_run(argv, **kwargs):
+        stdout = "abc123\n" if "rev-parse" in argv else " M file.py\n"
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(eval_manifest.subprocess, "run", fake_run)
+    assert eval_manifest.git_metadata() == {"commit_sha": "abc123", "dirty": True}
+
+
+def test_git_metadata_is_unknown_when_git_is_missing(monkeypatch):
+    from services import eval_manifest
+
+    monkeypatch.setattr(eval_manifest.shutil, "which", lambda name: None)
+    assert eval_manifest.git_metadata() == {"commit_sha": None, "dirty": None}
+
+
+def test_gpus_is_null_when_nvidia_smi_is_unavailable(monkeypatch):
+    from services import eval_manifest
+
+    monkeypatch.setattr(eval_manifest.shutil, "which", lambda name: None)
+    assert eval_manifest.collect_runtime_metadata()["gpus"] is None
