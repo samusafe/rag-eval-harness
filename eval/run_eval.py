@@ -20,9 +20,10 @@ WHY THIS EXISTS
     No eval = guessing.
 
 ARCHITECTURE
-    The reusable, observability-only core (scoring helpers, write_results,
-    log_mlflow, the per-question runner) lives in services/eval_service.py.
-    This CLI keeps only the presentation layer: the rich scorecard and argparse.
+    The reusable core lives in services/: eval_set (loader), eval_metrics
+    (pure scorers), eval_manifest (provenance), eval_service (per-question
+    runner, persistence, MLflow), gates (thresholds). This CLI keeps only the
+    presentation layer: the rich scorecard, argparse and gate wiring.
 
 USAGE (run from the repo root, with the same env/.env the RAG pipeline needs —
        Postgres/pgvector + Ollama must be reachable):
@@ -60,15 +61,17 @@ from rich.table import Table  # noqa: E402
 from rich.text import Text  # noqa: E402
 
 from config import settings  # noqa: E402
+from services.eval_manifest import collect_runtime_metadata  # noqa: E402
+from services.eval_metrics import aggregate  # noqa: E402
 from services.eval_service import (  # noqa: E402
-    _eval_one,
-    aggregate,
-    collect_runtime_metadata,
-    load_eval_set,
+    DEFAULT_EVAL_SET,
+    DEFAULT_OUT_DIR,
+    eval_one,
     log_mlflow,
     write_results,
 )
-from services.gates import check_gates  # noqa: E402
+from services.eval_set import EvalCase, load_eval_set, metrics_supported_by  # noqa: E402
+from services.gates import check_gates, unsatisfiable_gates  # noqa: E402
 from services.ollama_info import fetch_ollama_metadata  # noqa: E402
 from services.rag_chain import get_rag_chain  # noqa: E402
 
@@ -107,18 +110,19 @@ def _print_summary(agg: dict) -> None:
     table.add_row("Answerability accuracy", _fmt(agg["answerability_accuracy"]), "-")
     table.add_row("Citation coverage", _fmt(agg["citation_coverage"]), "-")
     table.add_row("Citation validity", _fmt(agg["citation_validity"]), "-")
-    table.add_row(
-        "Median latency",
-        f"{agg['median_latency_s']}s" if agg["median_latency_s"] is not None else "-",
-        "-",
-    )
+    table.add_row("Median latency", _seconds(agg["median_latency_s"]), "-")
+    table.add_row("P95 latency", _seconds(agg["p95_latency_s"]), "-")
     table.add_row("Questions", str(agg["n"]), "-")
     console.print()
     console.print(table)
 
 
 def _fmt(v) -> str:
-    return "-" if v is None else f"{v:.0%}" if v <= 1 else str(v)
+    return "-" if v is None else f"{v:.0%}"
+
+
+def _seconds(v) -> str:
+    return "-" if v is None else f"{v:.2f}s"
 
 
 def _probability(value: str) -> float:
@@ -135,10 +139,10 @@ def _non_negative(value: str) -> float:
     return parsed
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the RAG eval harness.")
-    parser.add_argument("--set", default=str(APP_ROOT / "eval" / "eval_set.example.jsonl"))
-    parser.add_argument("--out", default=str(APP_ROOT / "eval" / "results"))
+    parser.add_argument("--set", default=str(DEFAULT_EVAL_SET))
+    parser.add_argument("--out", default=str(DEFAULT_OUT_DIR))
     parser.add_argument("--collection", default=None, help="Optional collection_id filter")
     parser.add_argument(
         "--model",
@@ -168,20 +172,80 @@ def main() -> None:
                         help="Fail unless refusal_accuracy >= this")
     parser.add_argument("--gate-max-latency", type=_non_negative, default=None, metavar="8.0",
                         help="Fail if median_latency_s exceeds this (seconds)")
-    parser.add_argument("--gate-exact-hit-rate", type=_probability, default=None)
-    parser.add_argument("--gate-mrr", type=_probability, default=None)
-    parser.add_argument("--gate-answerability", type=_probability, default=None)
-    parser.add_argument("--gate-citation-coverage", type=_probability, default=None)
-    parser.add_argument("--gate-citation-validity", type=_probability, default=None)
+    parser.add_argument("--gate-max-p95-latency", type=_non_negative, default=None, metavar="12.0",
+                        help="Fail if p95_latency_s exceeds this (seconds)")
+    parser.add_argument("--gate-exact-hit-rate", type=_probability, default=None, metavar="0.8",
+                        help="Fail unless exact_retrieval_hit_rate >= this (needs expected_source_ids)")
+    parser.add_argument("--gate-mrr", type=_probability, default=None, metavar="0.6",
+                        help="Fail unless mean_reciprocal_rank >= this (needs expected_source_ids)")
+    parser.add_argument("--gate-answerability", type=_probability, default=None, metavar="0.9",
+                        help="Fail unless answerability_accuracy >= this (no refusal on answerable rows)")
+    parser.add_argument("--gate-citation-coverage", type=_probability, default=None, metavar="0.8",
+                        help="Fail unless citation_coverage >= this (answers that cite at all)")
+    parser.add_argument("--gate-citation-validity", type=_probability, default=None, metavar="1.0",
+                        help="Fail unless citation_validity >= this (cited headers were really supplied)")
+    return parser
+
+
+def gate_thresholds(args: argparse.Namespace) -> tuple[dict[str, float], dict[str, float]]:
+    """Translate gate flags into the (minimums, maximums) dicts check_gates reads."""
+    minimums = {
+        key: threshold
+        for key, threshold in (
+            ("retrieval_hit_rate", args.gate_hit_rate),
+            ("answer_keyword_recall", args.gate_recall),
+            ("refusal_accuracy", args.gate_refusal),
+            ("exact_retrieval_hit_rate", args.gate_exact_hit_rate),
+            ("mean_reciprocal_rank", args.gate_mrr),
+            ("answerability_accuracy", args.gate_answerability),
+            ("citation_coverage", args.gate_citation_coverage),
+            ("citation_validity", args.gate_citation_validity),
+        )
+        if threshold is not None
+    }
+    maximums = {
+        key: threshold
+        for key, threshold in (
+            ("median_latency_s", args.gate_max_latency),
+            ("p95_latency_s", args.gate_max_p95_latency),
+        )
+        if threshold is not None
+    }
+    return minimums, maximums
+
+
+def refuse_unsatisfiable_gates(
+    parser: argparse.ArgumentParser,
+    rows: list[EvalCase],
+    minimums: dict[str, float],
+    maximums: dict[str, float],
+) -> None:
+    """A gate the eval set cannot produce data for is a usage error, reported
+    before the first LLM call (exit 2, argparse's usage-error code)."""
+    problems = unsatisfiable_gates(minimums, maximums, metrics_supported_by(rows))
+    if problems:
+        parser.error("unsatisfiable gate(s):\n  " + "\n  ".join(problems))
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
 
     selected_model = args.model or settings.OLLAMA_CHAT_MODEL
     eval_set_path = Path(args.set)
-    rows = load_eval_set(eval_set_path, strict=not args.permissive_eval_set)
+    strict = not args.permissive_eval_set
+    rows = load_eval_set(eval_set_path, strict=strict)
+    minimums, maximums = gate_thresholds(args)
+    refuse_unsatisfiable_gates(parser, rows, minimums, maximums)
     if settings.CORPUS_REVISION == "unversioned":
         console.print(
             "[yellow]Warning: CORPUS_REVISION is unversioned; this run cannot prove "
             "that the underlying corpus matches another run.[/yellow]"
+        )
+    if settings.RERANK_MODEL_REVISION is None:
+        console.print(
+            "[yellow]Warning: RERANK_MODEL_REVISION is unpinned; the reranker resolves to whatever "
+            "the Hub's default branch points at, so two runs may not use the same weights.[/yellow]"
         )
 
     runtime_metadata = collect_runtime_metadata()
@@ -242,7 +306,7 @@ def main() -> None:
             task = progress.add_task("Evaluating", total=len(rows))
             for row in rows:
                 progress.update(task, description=f"[cyan]{escape(str(row.id))}[/cyan]")
-                r = _eval_one(row, retriever, chain)
+                r = eval_one(row, retriever, chain)
                 results.append(r)
                 _print_row(r)
                 progress.advance(task)
@@ -271,29 +335,18 @@ def main() -> None:
         eval_set_path=eval_set_path,
         collection_id=args.collection,
         runtime_metadata=runtime_metadata,
+        eval_set_strict=strict,
+        gates={**minimums, **maximums},
     )
-    console.print(f"\nSaved -> [cyan]{out_path}[/cyan]  (diff against a prior run to see if a change helped)")
+    console.print(
+        f"\nSaved -> [cyan]{escape(str(out_path))}[/cyan]  (diff against a prior run to see if a change helped)"
+    )
 
     if args.mlflow:
         log_mlflow(agg, selected_model, out_path)
 
     # Gates run LAST: the scorecard is already written and logged, so a failed
     # gate still leaves a full result file to diff against.
-    minimums = {
-        key: threshold
-        for key, threshold in (
-            ("retrieval_hit_rate", args.gate_hit_rate),
-            ("answer_keyword_recall", args.gate_recall),
-            ("refusal_accuracy", args.gate_refusal),
-            ("exact_retrieval_hit_rate", args.gate_exact_hit_rate),
-            ("mean_reciprocal_rank", args.gate_mrr),
-            ("answerability_accuracy", args.gate_answerability),
-            ("citation_coverage", args.gate_citation_coverage),
-            ("citation_validity", args.gate_citation_validity),
-        )
-        if threshold is not None
-    }
-    maximums = {"median_latency_s": args.gate_max_latency} if args.gate_max_latency is not None else {}
     if minimums or maximums:
         failures = check_gates(agg, minimums, maximums)
         if failures:

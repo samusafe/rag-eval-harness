@@ -2,7 +2,7 @@
 
 import pytest
 
-from services.gates import check_gates
+from services.gates import MAX_GATES, MIN_GATES, check_gates, unsatisfiable_gates
 
 GOOD_AGG = {
     "n": 10,
@@ -68,3 +68,38 @@ def test_unknown_min_metric_raises():
 def test_unknown_max_metric_raises():
     with pytest.raises(ValueError, match="Unknown max-gate"):
         check_gates(GOOD_AGG, maximums={"retrieval_hit_rate": 0.5})
+
+
+def test_p95_latency_is_a_max_gate():
+    assert "p95_latency_s" in MAX_GATES
+    agg = dict(GOOD_AGG, p95_latency_s=9.0)
+    assert check_gates(agg, maximums={"p95_latency_s": 8.0})
+
+
+@pytest.mark.parametrize("metric", MIN_GATES)
+def test_every_min_gate_key_is_produced_by_aggregate(metric):
+    from services.eval_metrics import aggregate
+
+    assert metric in aggregate([])
+
+
+@pytest.mark.parametrize("metric", MAX_GATES)
+def test_every_max_gate_key_is_produced_by_aggregate(metric):
+    from services.eval_metrics import aggregate
+
+    assert metric in aggregate([])
+
+
+def test_unsatisfiable_gates_names_metrics_the_eval_set_cannot_produce():
+    failures = unsatisfiable_gates(
+        minimums={"mean_reciprocal_rank": 0.5, "refusal_accuracy": 0.9},
+        maximums={"median_latency_s": 8.0},
+        supported={"refusal_accuracy", "median_latency_s"},
+    )
+    assert len(failures) == 1
+    assert "mean_reciprocal_rank" in failures[0]
+    assert "expected_source_ids" in failures[0]
+
+
+def test_unsatisfiable_gates_is_empty_when_everything_is_supported():
+    assert unsatisfiable_gates({"refusal_accuracy": 0.9}, {}, {"refusal_accuracy"}) == []
