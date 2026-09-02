@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 APP_ROOT = Path(__file__).resolve().parent.parent
@@ -29,6 +30,11 @@ sys.path.insert(0, str(APP_ROOT))
 from rich.console import Console  # noqa: E402
 from rich.markup import escape  # noqa: E402
 from rich.table import Table  # noqa: E402
+
+from config import settings  # noqa: E402
+from services.eval_compat import compatibility_issues  # noqa: E402
+
+__all__ = ["compatibility_issues", "main", "per_question_diff", "pick_latest"]
 
 console = Console()
 
@@ -43,15 +49,25 @@ SUMMARY_METRICS = [
     ("citation_coverage", "Citation coverage", True),
     ("citation_validity", "Citation validity", True),
     ("median_latency_s", "Median latency (s)", False),
+    ("p95_latency_s", "P95 latency (s)", False),
 ]
 
 # (per-result key, label, higher_is_better)
 PQ_METRICS = [
     ("retrieval_hit", "retrieval", True),
+    ("exact_retrieval_hit", "exact retrieval", True),
+    ("reciprocal_rank", "reciprocal rank", True),
     ("keyword_recall", "keyword recall", True),
     ("refusal_ok", "refusal", True),
+    ("answerability_ok", "answerability", True),
+    ("citation_present", "citation present", True),
+    ("citation_validity", "citation validity", True),
     ("latency_s", "latency", False),
 ]
+
+# Rates print as percentages; these are not rates.
+_SECONDS_KEYS = {"median_latency_s", "p95_latency_s", "latency_s"}
+_PLAIN_KEYS = {"mean_reciprocal_rank", "reciprocal_rank"}
 
 
 def load_run(path: Path) -> dict:
@@ -66,11 +82,27 @@ def load_run(path: Path) -> dict:
     return data
 
 
+def _run_started_at(path: Path) -> str:
+    """Sort key for a scorecard: the manifest's ISO-8601 UTC timestamp (lexically
+    chronological), falling back to the file mtime for pre-manifest scorecards.
+    Unreadable files sort first so they never displace a real run."""
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8")).get("run_manifest")
+    except (OSError, json.JSONDecodeError, AttributeError):
+        manifest = None
+    if isinstance(manifest, dict) and isinstance(manifest.get("timestamp_utc"), str):
+        return manifest["timestamp_utc"]
+    return datetime.fromtimestamp(path.stat().st_mtime, tz=UTC).isoformat().replace("+00:00", "Z")
+
+
 def pick_latest(out_dir: Path, n: int) -> list[Path]:
-    # Filenames embed a sortable %Y%m%d_%H%M%S stamp, so name sort == chronological.
+    """The N most recent RUNS, oldest first. Filenames start with the model
+    name (eval_<model>_<hash>_<stamp>.json), so a name sort is model-first,
+    not chronological -- `--latest 2` across two models would compare a model
+    against itself and hide the newest run. Order by run time instead."""
     if n < 2:
         raise SystemExit("--latest must be at least 2.")
-    files = sorted(out_dir.glob("eval_*.json"))
+    files = sorted(out_dir.glob("eval_*.json"), key=_run_started_at)
     if len(files) < n:
         raise SystemExit(f"Need {n} result files in {out_dir}, found {len(files)}.")
     return files[-n:]
@@ -79,7 +111,11 @@ def pick_latest(out_dir: Path, n: int) -> list[Path]:
 def _fmt_summary(key: str, v) -> str:
     if v is None:
         return "-"
-    return f"{v:.2f}s" if key == "median_latency_s" else f"{v:.0%}"
+    if key in _SECONDS_KEYS:
+        return f"{v:.2f}s"
+    if key in _PLAIN_KEYS:
+        return f"{v:.3f}"
+    return f"{v:.0%}"
 
 
 def _delta(key: str, base, cand, higher_better: bool) -> str:
@@ -91,7 +127,12 @@ def _delta(key: str, base, cand, higher_better: bool) -> str:
     improved = (d > 0) == higher_better
     color = "green" if improved else "red"
     arrow = "^" if d > 0 else "v"
-    shown = f"{arrow}{abs(d):.2f}s" if key == "median_latency_s" else f"{arrow}{abs(d) * 100:.1f}pts"
+    if key in _SECONDS_KEYS:
+        shown = f"{arrow}{abs(d):.2f}s"
+    elif key in _PLAIN_KEYS:
+        shown = f"{arrow}{abs(d):.3f}"
+    else:
+        shown = f"{arrow}{abs(d) * 100:.1f}pts"
     return f"[{color}]{shown}[/{color}]"
 
 
@@ -116,7 +157,7 @@ def _pq_fmt(key: str, v) -> str:
         return "-"
     if isinstance(v, bool):
         return "OK" if v else "X"
-    return f"{v:.2f}s" if key == "latency_s" else f"{v:.2f}"
+    return f"{v:.2f}s" if key in _SECONDS_KEYS else f"{v:.2f}"
 
 
 def per_question_diff(base: dict, cand: dict) -> tuple[list, list, list]:
@@ -133,8 +174,8 @@ def per_question_diff(base: dict, cand: dict) -> tuple[list, list, list]:
                     continue
                 improved = (not bv) and bool(cv)
             else:
-                # Ignore latency noise under 0.5s.
-                if key == "latency_s" and abs(cv - bv) < 0.5:
+                # Ignore per-question latency deltas under the configured noise floor.
+                if key == "latency_s" and abs(cv - bv) < settings.COMPARE_LATENCY_NOISE_S:
                     continue
                 if abs(cv - bv) < 1e-9:
                     continue
@@ -144,49 +185,6 @@ def per_question_diff(base: dict, cand: dict) -> tuple[list, list, list]:
     only_base = [i for i in b if i not in c]
     only_cand = [i for i in c if i not in b]
     return rows, only_base, only_cand
-
-
-def compatibility_issues(base: dict, candidate: dict) -> tuple[list[str], list[str]]:
-    """Return (blocking, advisory) provenance differences."""
-    left = base.get("run_manifest")
-    right = candidate.get("run_manifest")
-    if not isinstance(left, dict) or not isinstance(right, dict):
-        return ["one or both scorecards have no run_manifest"], []
-
-    blocking_paths = (
-        ("eval_set_sha256",),
-        ("prompt_sha256",),
-        ("embedding_model",),
-        ("reranker_model",),
-        ("reranker", "revision"),
-        ("retrieval",),
-        ("runtime", "ollama_embedding_model", "digest"),
-    )
-    advisory_paths = (
-        ("generation",),
-        ("runtime", "ollama_chat_model", "digest"),
-        ("runtime", "ollama_chat_model", "quantization_level"),
-        ("runtime", "packages"),
-        ("runtime", "gpus"),
-    )
-
-    def value(data: dict, path: tuple[str, ...]):
-        current: object = data
-        for key in path:
-            if not isinstance(current, dict):
-                return None
-            current = current.get(key)
-        return current
-
-    def differences(paths: tuple[tuple[str, ...], ...]) -> list[str]:
-        issues = []
-        for path in paths:
-            left_value, right_value = value(left, path), value(right, path)
-            if left_value != right_value:
-                issues.append(f"{'.'.join(path)} differs: {left_value!r} vs {right_value!r}")
-        return issues
-
-    return differences(blocking_paths), differences(advisory_paths)
 
 
 def print_per_question(rows: list, only_base: list, only_cand: list) -> None:
