@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 # All chunks share one collection — simplest schema that works (KISS); split
 # only if a second, genuinely different vector space shows up.
-COLLECTION_NAME = "rag_documents"
+COLLECTION_NAME = settings.PGVECTOR_COLLECTION_NAME
 
 _embeddings: OllamaEmbeddings | None = None
 _vector_store: PGVector | None = None
@@ -50,6 +50,20 @@ def get_embeddings() -> OllamaEmbeddings:
     return _embeddings
 
 
+def engine_args() -> dict[str, object]:
+    """SQLAlchemy engine settings for the strictly sequential eval: one pooled
+    connection, pre-ping to survive an idle Postgres, and a server-side
+    statement_timeout so a stalled vector scan fails loud (QueryCanceled)
+    instead of hanging the run — DATABASE_CONNECT_TIMEOUT only bounds the
+    handshake."""
+    return {
+        "pool_size": 1,
+        "max_overflow": 1,
+        "pool_pre_ping": True,
+        "connect_args": {"options": f"-c statement_timeout={settings.DATABASE_STATEMENT_TIMEOUT_MS}"},
+    }
+
+
 def get_vector_store() -> PGVector:
     """PGVector store over Postgres (singleton — owns its own connection
     pool). Assumes a Postgres instance with the `pgvector` extension enabled
@@ -62,7 +76,7 @@ def get_vector_store() -> PGVector:
             collection_name=COLLECTION_NAME,
             connection=settings.database_url,
             distance_strategy=DistanceStrategy.COSINE,
-            engine_args={"pool_size": 1, "max_overflow": 1, "pool_pre_ping": True},
+            engine_args=engine_args(),
             use_jsonb=True,
         )
         logger.info("PGVector store ready (collection=%s)", COLLECTION_NAME)

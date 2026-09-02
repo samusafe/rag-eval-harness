@@ -11,12 +11,13 @@
 
 from pathlib import Path
 from typing import Literal
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 APP_ROOT = Path(__file__).resolve().parent
+LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
 class Settings(BaseSettings):
@@ -42,6 +43,11 @@ class Settings(BaseSettings):
     OLLAMA_REQUEST_TIMEOUT: float = 120.0
     # bench_ollama.py runs on the host, so Ollama is plain localhost there too.
     OLLAMA_BENCH_URL: str = "http://localhost:11434"
+    # Ollama HOST tuning flags, recorded in the run manifest for provenance only
+    # (the harness does not set them; export them before `ollama serve`).
+    OLLAMA_FLASH_ATTENTION: str | None = None
+    OLLAMA_KV_CACHE_TYPE: str | None = None
+    OLLAMA_NUM_PARALLEL: str | None = None
 
     # --- Postgres + pgvector (wherever your ingested chunks live) ---
     DATABASE_HOST: str = "localhost"
@@ -51,6 +57,9 @@ class Settings(BaseSettings):
     DATABASE_NAME: str = "rag_eval"
     DATABASE_SSLMODE: Literal["disable", "allow", "prefer", "require", "verify-ca", "verify-full"] = "prefer"
     DATABASE_CONNECT_TIMEOUT: int = 10
+    # Bounds every statement, not just the handshake: a stalled pgvector scan
+    # must fail loud instead of hanging the whole eval run.
+    DATABASE_STATEMENT_TIMEOUT_MS: int = 30_000
 
     # --- Retrieval / reranking ---
     # Retrieve a wider candidate set from pgvector, then rerank down to the
@@ -66,6 +75,11 @@ class Settings(BaseSettings):
     RERANK_MAX_LENGTH: int = 512
     RERANK_BATCH_SIZE: int = 8
     PGVECTOR_DISTANCE_STRATEGY: Literal["cosine"] = "cosine"
+    # All chunks share one collection — simplest schema that works (KISS).
+    PGVECTOR_COLLECTION_NAME: str = "rag_documents"
+    # Context budget estimate: Ollama tokenization is model-specific and not
+    # exposed through the chain, so chars/token is an explicit approximation.
+    CHARS_PER_TOKEN_ESTIMATE: int = 4
     # User-managed corpus/ingestion version. Set this to a commit, dataset
     # digest, or immutable release ID before treating comparisons as citable.
     CORPUS_REVISION: str = "unversioned"
@@ -74,10 +88,20 @@ class Settings(BaseSettings):
     MLFLOW_TRACKING_URI: str = "http://localhost:5000"
     MLFLOW_EXPERIMENT_NAME: str = "rag-eval-harness"
     MLFLOW_BENCH_EXPERIMENT_NAME: str = "rag-eval-harness-bench"
+    # Scorecards carry verbatim questions/answers. Shipping them to a non-local
+    # tracking server is opt-in: loopback and file/sqlite stores always work,
+    # anything else needs https AND this flag.
+    MLFLOW_ALLOW_REMOTE: bool = False
 
     # Artifact privacy. `full` preserves the historical scorecard; `redacted`
     # stores hashes instead of question/answer text.
     RESULT_CONTENT_MODE: Literal["full", "redacted"] = "full"
+
+    # --- Harness internals ---
+    # Wall-clock bound for best-effort host probes (git, nvidia-smi).
+    HOST_PROBE_TIMEOUT: float = 2.0
+    # compare_runs.py ignores per-question latency deltas below this (noise).
+    COMPARE_LATENCY_NOISE_S: float = 0.5
 
     @property
     def database_url(self) -> str:
@@ -101,6 +125,8 @@ class Settings(BaseSettings):
         "RERANK_MAX_LENGTH",
         "RERANK_BATCH_SIZE",
         "DATABASE_CONNECT_TIMEOUT",
+        "DATABASE_STATEMENT_TIMEOUT_MS",
+        "CHARS_PER_TOKEN_ESTIMATE",
     )
     @classmethod
     def positive_integers(cls, value: int) -> int:
@@ -108,11 +134,27 @@ class Settings(BaseSettings):
             raise ValueError("must be greater than zero")
         return value
 
-    @field_validator("OLLAMA_REQUEST_TIMEOUT")
+    @field_validator("OLLAMA_REQUEST_TIMEOUT", "HOST_PROBE_TIMEOUT")
     @classmethod
     def positive_timeout(cls, value: float) -> float:
         if value <= 0:
             raise ValueError("must be greater than zero")
+        return value
+
+    @field_validator("COMPARE_LATENCY_NOISE_S")
+    @classmethod
+    def non_negative(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("must not be negative")
+        return value
+
+    @field_validator("RERANK_MODEL_REVISION", mode="before")
+    @classmethod
+    def blank_revision_is_unpinned(cls, value: object) -> object:
+        # `.env` files cannot express null; `RERANK_MODEL_REVISION=` must mean
+        # "unpinned", not the literal revision "".
+        if isinstance(value, str):
+            return value.strip() or None
         return value
 
     @field_validator("OLLAMA_TEMPERATURE")
@@ -128,13 +170,34 @@ class Settings(BaseSettings):
             raise ValueError("RERANK_TOP_N cannot exceed RETRIEVAL_TOP_K")
         if self.OLLAMA_NUM_PREDICT + self.RAG_CONTEXT_RESERVE_TOKENS >= self.OLLAMA_NUM_CTX:
             raise ValueError("output and prompt reserves must leave room for retrieved context")
-        local_hosts = {"localhost", "127.0.0.1", "::1"}
-        if self.DATABASE_HOST.casefold() not in local_hosts:
+        if self.DATABASE_HOST.casefold() not in LOCAL_HOSTS:
             if self.DATABASE_PASSWORD == "ragpassword":
                 raise ValueError("the default database password is only allowed for localhost")
-            if self.DATABASE_SSLMODE == "disable":
-                raise ValueError("SSL cannot be disabled for a non-local database")
+            if self.DATABASE_SSLMODE in {"disable", "allow", "prefer"}:
+                raise ValueError(
+                    "a non-local database must enforce TLS: set DATABASE_SSLMODE to "
+                    "require, verify-ca or verify-full (prefer/allow silently fall back to plaintext)"
+                )
+        self._check_mlflow_uri()
         return self
+
+    def _check_mlflow_uri(self) -> None:
+        """Loopback and local stores (file:, sqlite:, a bare path) always pass.
+        Any other host must use https AND set MLFLOW_ALLOW_REMOTE=true, because
+        `--mlflow` uploads the full scorecard artifact there."""
+        parsed = urlparse(self.MLFLOW_TRACKING_URI)
+        if parsed.scheme not in {"http", "https"}:
+            return
+        host = (parsed.hostname or "").casefold()
+        if host in LOCAL_HOSTS:
+            return
+        if not self.MLFLOW_ALLOW_REMOTE:
+            raise ValueError(
+                f"MLFLOW_TRACKING_URI {self.MLFLOW_TRACKING_URI!r} is not local; scorecards contain "
+                "questions and answers, so set MLFLOW_ALLOW_REMOTE=true to confirm the upload target"
+            )
+        if parsed.scheme != "https":
+            raise ValueError("a remote MLFLOW_TRACKING_URI must use https")
 
     model_config = SettingsConfigDict(
         env_file=APP_ROOT / ".env",
